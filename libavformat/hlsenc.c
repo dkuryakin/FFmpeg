@@ -24,6 +24,8 @@
 #include "config_components.h"
 #include <stdint.h>
 #include <time.h>
+#include <string.h>
+#include <errno.h>
 #if HAVE_UNISTD_H
 #include <unistd.h>
 #endif
@@ -39,8 +41,12 @@
 #include "libavutil/random_seed.h"
 #include "libavutil/time.h"
 #include "libavutil/time_internal.h"
+#include "libavutil/imgutils.h"
+#include "libavutil/file_open.h"
 
 #include "libavcodec/defs.h"
+#include "libavcodec/avcodec.h"
+#include "libswscale/swscale.h"
 
 #include "avformat.h"
 #include "avio_internal.h"
@@ -188,6 +194,15 @@ typedef struct VariantStream {
     const char *ccgroup;  /* closed caption group name */
     const char *varname;  /* variant name */
     const char *subtitle_varname;  /* subtitle variant name */
+
+    /* Frame output fields */
+    AVCodecContext *decoder_ctx;  /* decoder context for video stream */
+    AVFrame *decoded_frame;       /* decoded frame */
+    SwsContext *sws_ctx;          /* context for BGR conversion */
+    uint8_t *bgr_buffer;          /* buffer for BGR data */
+    int bgr_linesize[1];          /* line size for BGR buffer */
+    int frame_counter;            /* frame counter for interval writing */
+    int64_t segment_start_pts;    /* PTS of current segment start */
 } VariantStream;
 
 typedef struct ClosedCaptionsStream {
@@ -261,6 +276,10 @@ typedef struct HLSContext {
     char *headers;
     int has_default_key; /* has DEFAULT field of var_stream_map */
     int has_video_m3u8; /* has video stream m3u8 list */
+
+    /* Frame output fields */
+    char *frame_output_path;      /* path to frame.raw file (NULL if not used) */
+    int frame_output_interval;    /* write every Nth frame (default: 1) */
 } HLSContext;
 
 static int strftime_expand(const char *fmt, char **dest)
@@ -1836,6 +1855,13 @@ static int hls_start(AVFormatContext *s, VariantStream *vs)
             return err;
     }
 
+    /* Reset segment start PTS for frame output */
+    if (c->frame_output_path) {
+        av_log(s, AV_LOG_DEBUG, "hls_start() called, resetting segment_start_pts from %"PRId64" to AV_NOPTS_VALUE\n",
+               vs->segment_start_pts);
+        vs->segment_start_pts = AV_NOPTS_VALUE;
+    }
+
     return 0;
 fail:
     av_dict_free(&options);
@@ -2284,6 +2310,194 @@ fail:
     return ret;
 }
 
+static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *vs,
+                           AVPacket *pkt, AVStream *st)
+{
+    AVCodecContext *dec_ctx = vs->decoder_ctx;
+    AVFrame *frame = vs->decoded_frame;
+    int ret;
+    char temp_path[MAX_URL_SIZE];
+    FILE *fp = NULL;
+    const char *segment_name;
+    double time_offset = 0.0;
+    AVRational time_base = st->time_base;
+    int bgr_size;
+
+    if (!dec_ctx || !frame) {
+        av_log(s, AV_LOG_WARNING, "Decoder not initialized for frame output\n");
+        return 0;
+    }
+
+    /* Try to receive frame from decoder - packet was already sent in hls_write_packet() */
+    /* We try multiple times to drain any pending frames */
+    int max_attempts = 3;
+    ret = AVERROR(EAGAIN);
+    
+    for (int attempt = 0; attempt < max_attempts && ret == AVERROR(EAGAIN); attempt++) {
+        ret = avcodec_receive_frame(dec_ctx, frame);
+        if (ret == 0) {
+            /* Got a frame, continue processing */
+            break;
+        } else if (ret == AVERROR(EAGAIN)) {
+            /* Frame not ready yet, decoder needs more input - this is normal for H.264 */
+            if (attempt == max_attempts - 1) {
+                av_log(s, AV_LOG_DEBUG, "Frame not ready after %d attempts, decoder needs more packets\n", max_attempts);
+                return 0;
+            }
+            /* Continue to next attempt */
+        } else if (ret == AVERROR_EOF) {
+            av_log(s, AV_LOG_DEBUG, "Decoder EOF\n");
+            return 0;
+        } else if (ret < 0) {
+            av_log(s, AV_LOG_WARNING, "Error receiving frame from decoder: %s\n", av_err2str(ret));
+            return 0;
+        }
+    }
+    
+    if (ret != 0) {
+        /* Still no frame after all attempts */
+        return 0;
+    }
+
+    av_log(s, AV_LOG_DEBUG, "Frame decoded successfully: %dx%d, format=%d\n",
+           frame->width, frame->height, frame->format);
+
+    /* Convert to BGR */
+    if (!vs->sws_ctx) {
+        av_log(s, AV_LOG_WARNING, "SwsContext not initialized\n");
+        return 0;
+    }
+
+    bgr_size = av_image_get_buffer_size(AV_PIX_FMT_BGR24, frame->width, frame->height, 1);
+    if (bgr_size < 0) {
+        av_log(s, AV_LOG_WARNING, "Error calculating BGR buffer size\n");
+        return 0;
+    }
+
+    if (!vs->bgr_buffer || vs->bgr_linesize[0] < frame->width * 3) {
+        av_freep(&vs->bgr_buffer);
+        vs->bgr_buffer = av_malloc(bgr_size);
+        if (!vs->bgr_buffer) {
+            av_log(s, AV_LOG_WARNING, "Error allocating BGR buffer\n");
+            return 0;
+        }
+        vs->bgr_linesize[0] = frame->width * 3;
+        av_log(s, AV_LOG_DEBUG, "Allocated BGR buffer: %d bytes\n", bgr_size);
+    }
+
+    ret = sws_scale(vs->sws_ctx, (const uint8_t * const *)frame->data, frame->linesize,
+                    0, frame->height, &vs->bgr_buffer, vs->bgr_linesize);
+    if (ret < 0) {
+        av_log(s, AV_LOG_WARNING, "Error converting frame to BGR: %s\n", av_err2str(ret));
+        return 0;
+    }
+    av_log(s, AV_LOG_DEBUG, "Frame converted to BGR: %d lines\n", ret);
+
+    /* Get segment name */
+    if (vs->avf->url && vs->avf->url[0]) {
+        segment_name = av_basename(vs->avf->url);
+    } else if (vs->current_segment_final_filename_fmt[0]) {
+        segment_name = vs->current_segment_final_filename_fmt;
+    } else {
+        segment_name = "unknown";
+    }
+
+    /* Calculate time offset from segment start */
+    if (vs->segment_start_pts != AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE) {
+        int64_t pts_diff = pkt->pts - vs->segment_start_pts;
+        time_offset = (double)pts_diff * time_base.num / time_base.den;
+        av_log(s, AV_LOG_DEBUG, "Frame time offset: segment=%s, pkt_pts=%"PRId64", segment_start_pts=%"PRId64", pts_diff=%"PRId64", time_offset=%.6f\n",
+               segment_name, pkt->pts, vs->segment_start_pts, pts_diff, time_offset);
+    } else {
+        av_log(s, AV_LOG_WARNING, "Frame time offset: segment=%s, pkt_pts=%"PRId64", segment_start_pts=%"PRId64", time_offset=0.0 (using default)\n",
+               segment_name, pkt->pts, vs->segment_start_pts);
+        time_offset = 0.0; // Default to 0 if PTS is not available
+    }
+
+    /* Calculate additional metadata */
+    double fps = 0.0;
+    if (st->avg_frame_rate.num && st->avg_frame_rate.den) {
+        fps = av_q2d(st->avg_frame_rate);
+    }
+    
+    int64_t bitrate = 0;
+    /* Try to get bitrate from various sources */
+    if (dec_ctx->bit_rate > 0) {
+        bitrate = dec_ctx->bit_rate;
+    } else if (st->codecpar->bit_rate > 0) {
+        bitrate = st->codecpar->bit_rate;
+    } else if (s->streams && pkt->stream_index < s->nb_streams) {
+        /* Try to get from original input stream */
+        AVStream *input_st = s->streams[pkt->stream_index];
+        if (input_st->codecpar->bit_rate > 0) {
+            bitrate = input_st->codecpar->bit_rate;
+        }
+    }
+    
+    /* If still no bitrate, try to estimate from packet size and duration */
+    if (bitrate == 0 && pkt->size > 0 && pkt->duration > 0 && time_base.num > 0 && time_base.den > 0) {
+        double duration_sec = (double)pkt->duration * time_base.num / time_base.den;
+        if (duration_sec > 0) {
+            /* Estimate bitrate: bits per second = (packet_size * 8) / duration_sec */
+            bitrate = (int64_t)((double)pkt->size * 8.0 / duration_sec);
+        }
+    }
+    
+    int64_t pts = pkt->pts;
+    int is_keyframe = (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
+
+    /* Create temporary file path */
+    snprintf(temp_path, sizeof(temp_path), "%s.tmp", hls->frame_output_path);
+
+    /* Write to temporary file atomically */
+    fp = avpriv_fopen_utf8(temp_path, "wb");
+    if (!fp) {
+        av_log(s, AV_LOG_WARNING, "Error opening temporary file %s: %s\n",
+               temp_path, strerror(errno));
+        return 0;
+    }
+
+    /* Write metadata as single line with key=value format: name=xxx.ts,offset=0.123,width=1920,height=1080,fps=30.000,bitrate=5000000,pts=123456,is_keyframe=1 */
+    if (fprintf(fp, "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
+                segment_name, time_offset, frame->width, frame->height,
+                fps, bitrate, pts, is_keyframe) < 0) {
+        av_log(s, AV_LOG_WARNING, "Error writing metadata to %s\n", temp_path);
+        fclose(fp);
+        unlink(temp_path);
+        return 0;
+    }
+
+    /* Write BGR data - written in one chunk for optimal performance */
+    if (fwrite(vs->bgr_buffer, 1, bgr_size, fp) != bgr_size) {
+        av_log(s, AV_LOG_WARNING, "Error writing BGR data to %s\n", temp_path);
+        fclose(fp);
+        unlink(temp_path);
+        return 0;
+    }
+    
+    /* Flush to ensure all data is written before closing */
+    fflush(fp);
+
+    if (fclose(fp) != 0) {
+        av_log(s, AV_LOG_WARNING, "Error closing temporary file %s\n", temp_path);
+        unlink(temp_path);
+        return 0;
+    }
+
+    /* Atomically rename */
+    if (rename(temp_path, hls->frame_output_path) < 0) {
+        av_log(s, AV_LOG_WARNING, "Error renaming %s to %s: %s\n",
+               temp_path, hls->frame_output_path, strerror(errno));
+        unlink(temp_path);
+        return 0;
+    }
+
+    av_log(s, AV_LOG_DEBUG, "Frame written successfully to %s (segment: %s, offset: %.6f, size: %d, pkt_pts=%"PRId64", segment_start_pts=%"PRId64")\n",
+           hls->frame_output_path, segment_name, time_offset, bgr_size, pkt->pts, vs->segment_start_pts);
+
+    return 0;
+}
+
 static int hls_write_header(AVFormatContext *s)
 {
     HLSContext *hls = s->priv_data;
@@ -2328,6 +2542,95 @@ static int hls_write_header(AVFormatContext *s)
             }
             write_codec_attr(outer_st, vs);
 
+            /* Initialize decoder for frame output if needed */
+            /* IMPORTANT: Packets in hls_write_packet() come AFTER encoding, so we need to decode
+             * the OUTPUT codec (H.264), not the input codec (HEVC). Use inner_st which is the
+             * output stream codec parameters. */
+            if (hls->frame_output_path && outer_st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+                !vs->decoder_ctx && inner_st) {
+                const AVCodec *codec;
+                AVCodecContext *dec_ctx;
+                AVFrame *frame;
+                SwsContext *sws_ctx;
+                enum AVPixelFormat pix_fmt;
+
+                av_log(s, AV_LOG_DEBUG, "Initializing decoder for frame output: input_codec_id=%d, output_codec_id=%d\n",
+                       outer_st->codecpar->codec_id, inner_st->codecpar->codec_id);
+                /* Use output stream codec (inner_st) because packets are already encoded */
+                codec = avcodec_find_decoder(inner_st->codecpar->codec_id);
+                if (!codec) {
+                    av_log(s, AV_LOG_WARNING, "Could not find decoder for codec %d\n",
+                           outer_st->codecpar->codec_id);
+                    continue;
+                }
+                av_log(s, AV_LOG_DEBUG, "Found decoder: %s\n", codec->name);
+
+                dec_ctx = avcodec_alloc_context3(codec);
+                if (!dec_ctx) {
+                    av_log(s, AV_LOG_WARNING, "Could not allocate decoder context\n");
+                    continue;
+                }
+
+                /* Use output stream codec parameters because packets are already encoded */
+                ret = avcodec_parameters_to_context(dec_ctx, inner_st->codecpar);
+                if (ret < 0) {
+                    av_log(s, AV_LOG_WARNING, "Could not copy codec parameters: %s\n",
+                           av_err2str(ret));
+                    avcodec_free_context(&dec_ctx);
+                    continue;
+                }
+                
+                /* Log extradata info for debugging */
+                if (inner_st->codecpar->extradata && inner_st->codecpar->extradata_size > 0) {
+                    av_log(s, AV_LOG_DEBUG, "Decoder extradata: %d bytes\n",
+                           inner_st->codecpar->extradata_size);
+                } else {
+                    av_log(s, AV_LOG_WARNING, "No extradata in output stream - decoder may need SPS/PPS from packets\n");
+                }
+
+                ret = avcodec_open2(dec_ctx, codec, NULL);
+                if (ret < 0) {
+                    av_log(s, AV_LOG_WARNING, "Could not open decoder: %s\n", av_err2str(ret));
+                    avcodec_free_context(&dec_ctx);
+                    continue;
+                }
+
+                frame = av_frame_alloc();
+                if (!frame) {
+                    av_log(s, AV_LOG_WARNING, "Could not allocate frame\n");
+                    avcodec_free_context(&dec_ctx);
+                    continue;
+                }
+
+                /* Determine pixel format for conversion - use decoder's preferred format */
+                pix_fmt = dec_ctx->pix_fmt;
+                if (pix_fmt == AV_PIX_FMT_NONE || pix_fmt == AV_PIX_FMT_YUVJ420P) {
+                    /* Try to get format from codecpar, fallback to YUV420P */
+                    if (outer_st->codecpar->format != AV_PIX_FMT_NONE) {
+                        pix_fmt = outer_st->codecpar->format;
+                    } else {
+                        pix_fmt = AV_PIX_FMT_YUV420P; /* default fallback */
+                    }
+                }
+
+                /* Use fast bilinear for better performance - quality is acceptable for frame output */
+                sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, pix_fmt,
+                                        dec_ctx->width, dec_ctx->height, AV_PIX_FMT_BGR24,
+                                        SWS_FAST_BILINEAR, NULL, NULL, NULL);
+                if (!sws_ctx) {
+                    av_log(s, AV_LOG_WARNING, "Could not create SwsContext\n");
+                    av_frame_free(&frame);
+                    avcodec_free_context(&dec_ctx);
+                    continue;
+                }
+
+                vs->decoder_ctx = dec_ctx;
+                vs->decoded_frame = frame;
+                vs->sws_ctx = sws_ctx;
+                vs->frame_counter = 0;
+                vs->segment_start_pts = AV_NOPTS_VALUE;
+                av_log(s, AV_LOG_INFO, "Decoder initialized successfully for frame output\n");
+            }
         }
         /* Update the Codec Attr string for the mapped audio groups */
         if (vs->has_video && vs->agroup) {
@@ -2450,10 +2753,18 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
         vs->start_pts = pkt->pts;
         if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
             vs->start_pts_from_audio = 1;
+        /* Initialize segment start PTS for frame output */
+        if (hls->frame_output_path && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            vs->segment_start_pts = pkt->pts;
+        }
     }
     if (vs->start_pts_from_audio && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && vs->start_pts > pkt->pts) {
         vs->start_pts = pkt->pts;
         vs->start_pts_from_audio = 0;
+        /* Update segment start PTS for frame output */
+        if (hls->frame_output_path) {
+            vs->segment_start_pts = pkt->pts;
+        }
     }
 
     if (vs->has_video) {
@@ -2464,6 +2775,36 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
     if (pkt->pts == AV_NOPTS_VALUE)
         is_ref_pkt = can_split = 0;
 
+    /* Write frame if frame output is enabled - non-blocking, skips if decoder is busy */
+    /* Packets in hls_write_packet() come AFTER encoding, so they are already encoded.
+     * We need to use the output stream codec for decoding, not the input stream codec.
+     * IMPORTANT: We need to send ALL packets to the decoder, but only try to get frames
+     * for every Nth packet. The decoder needs all packets to decode properly.
+     * NOTE: This must be done AFTER checking for new segment start (vs->new_start) to ensure
+     * segment_start_pts is set correctly. */
+    if (hls->frame_output_path && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && vs && oc) {
+        if (!vs->decoder_ctx) {
+            /* Decoder not initialized yet - this should not happen, but log it */
+            av_log(s, AV_LOG_DEBUG, "Decoder not initialized for stream %d\n", pkt->stream_index);
+        } else {
+            vs->frame_counter++;
+            
+            /* Always send packets to decoder (it needs all of them) */
+            int ret = avcodec_send_packet(vs->decoder_ctx, pkt);
+            if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
+                av_log(s, AV_LOG_WARNING, "Error sending packet to decoder: %s\n", av_err2str(ret));
+            }
+            
+            /* Only try to get frame for every Nth packet */
+            if (vs->frame_counter % hls->frame_output_interval == 0) {
+                av_log(s, AV_LOG_DEBUG, "Trying to get frame %d (interval=%d)\n",
+                       vs->frame_counter, hls->frame_output_interval);
+                /* This function tries to receive a frame from decoder */
+                write_frame_raw(s, hls, vs, pkt, st);
+            }
+        }
+    }
+
     if (is_ref_pkt) {
         if (vs->end_pts == AV_NOPTS_VALUE)
             vs->end_pts = pkt->pts;
@@ -2472,6 +2813,18 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
             vs->duration = (double)(pkt->pts - vs->end_pts)
                                        * st->time_base.num / st->time_base.den;
             vs->dpp = (double)(pkt->duration) * st->time_base.num / st->time_base.den;
+            /* Update segment start PTS for frame output when new segment starts */
+            if (hls->frame_output_path && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                vs->segment_start_pts = pkt->pts;
+                const char *seg_name = "unknown";
+                if (vs->avf->url && vs->avf->url[0]) {
+                    seg_name = av_basename(vs->avf->url);
+                } else if (vs->current_segment_final_filename_fmt[0]) {
+                    seg_name = vs->current_segment_final_filename_fmt;
+                }
+                av_log(s, AV_LOG_DEBUG, "New segment started (vs->new_start), segment=%s, segment_start_pts=%"PRId64", pkt_pts=%"PRId64"\n",
+                       seg_name, vs->segment_start_pts, pkt->pts);
+            }
         } else {
             if (pkt->duration) {
                 vs->duration += (double)(pkt->duration) * st->time_base.num / st->time_base.den;
@@ -2652,6 +3005,22 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
             sls_flag_file_rename(hls, vs, old_filename);
             ret = hls_start(s, vs);
         }
+        
+        /* Update segment start PTS for frame output AFTER hls_start() */
+        /* hls_start() resets segment_start_pts to AV_NOPTS_VALUE and sets vs->new_start = 1 */
+        /* We need to update it with the PTS of the packet that caused the split */
+        if (hls->frame_output_path && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            vs->segment_start_pts = pkt->pts;
+            const char *new_seg_name = "unknown";
+            if (vs->avf->url && vs->avf->url[0]) {
+                new_seg_name = av_basename(vs->avf->url);
+            } else if (vs->current_segment_final_filename_fmt[0]) {
+                new_seg_name = vs->current_segment_final_filename_fmt;
+            }
+            av_log(s, AV_LOG_DEBUG, "After hls_start(), updated segment_start_pts=%"PRId64" for new segment=%s (pkt_pts=%"PRId64")\n",
+                   vs->segment_start_pts, new_seg_name, pkt->pts);
+        }
+        
         vs->number++;
         av_freep(&old_filename);
 
@@ -2699,12 +3068,22 @@ static void hls_deinit(AVFormatContext *s)
         hls_free_segments(vs->old_segments);
         av_freep(&vs->m3u8_name);
         av_freep(&vs->streams);
+
+        /* Free frame output resources */
+        if (vs->sws_ctx) {
+            sws_freeContext(vs->sws_ctx);
+            vs->sws_ctx = NULL;
+        }
+        av_freep(&vs->bgr_buffer);
+        av_frame_free(&vs->decoded_frame);
+        avcodec_free_context(&vs->decoder_ctx);
     }
 
     ff_format_io_close(s, &hls->m3u8_out);
     ff_format_io_close(s, &hls->sub_m3u8_out);
     ff_format_io_close(s, &hls->http_delete);
     av_freep(&hls->key_basename);
+    av_freep(&hls->frame_output_path);
     av_freep(&hls->var_streams);
     av_freep(&hls->cc_streams);
     av_freep(&hls->master_m3u8_url);
@@ -3162,6 +3541,8 @@ static const AVOption options[] = {
     {"timeout", "set timeout for socket I/O operations", OFFSET(timeout), AV_OPT_TYPE_DURATION, { .i64 = -1 }, -1, INT_MAX, .flags = E },
     {"ignore_io_errors", "Ignore IO errors for stable long-duration runs with network output", OFFSET(ignore_io_errors), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, E },
     {"headers", "set custom HTTP headers, can override built in default headers", OFFSET(headers), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
+    {"hls_frame_output", "path to write current frame as BGR raw data", OFFSET(frame_output_path), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
+    {"hls_frame_interval", "write every Nth frame (default: 1)", OFFSET(frame_output_interval), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, E},
     { NULL },
 };
 
