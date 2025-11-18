@@ -203,6 +203,7 @@ typedef struct VariantStream {
     int bgr_linesize[1];          /* line size for BGR buffer */
     int frame_counter;            /* frame counter for interval writing */
     int64_t segment_start_pts;    /* PTS of current segment start */
+    double current_segment_prog_date_time;  /* program_date_time of current segment start (0.0 if not set) */
 } VariantStream;
 
 typedef struct ClosedCaptionsStream {
@@ -1174,6 +1175,8 @@ static int parse_playlist(AVFormatContext *s, const char *url, VariantStream *vs
     const char *ptr;
     const char *end;
     double discont_program_date_time = 0;
+    double next_segment_prog_date_time = 0.0;  /* program_date_time for next segment after parsing */
+    double current_segment_prog_date_time = 0.0;  /* program_date_time for current segment being parsed */
 
     if ((ret = ffio_open_whitelist(&in, url, AVIO_FLAG_READ,
                                    &s->interrupt_callback, NULL,
@@ -1245,8 +1248,10 @@ static int parse_playlist(AVFormatContext *s, const char *url, VariantStream *vs
             program_date_time.tm_sec = s;
             program_date_time.tm_isdst = -1;
 
-            discont_program_date_time = mktime(&program_date_time);
-            discont_program_date_time += (double)(ms / 1000);
+            current_segment_prog_date_time = mktime(&program_date_time);
+            current_segment_prog_date_time += (double)(ms / 1000);
+            /* Also set discont_program_date_time for discontinuity handling */
+            discont_program_date_time = current_segment_prog_date_time;
         } else if (av_strstart(line, "#", NULL)) {
             continue;
         } else if (line[0]) {
@@ -1278,12 +1283,34 @@ static int parse_playlist(AVFormatContext *s, const char *url, VariantStream *vs
                 if (discont_program_date_time) {
                     vs->last_segment->discont_program_date_time = discont_program_date_time;
                     discont_program_date_time += vs->duration;
+                    next_segment_prog_date_time = discont_program_date_time;
+                } else if (current_segment_prog_date_time > 0.0) {
+                    /* Track program_date_time for next segment even without discontinuity */
+                    /* Use current_segment_prog_date_time + duration to get next segment's program_date_time */
+                    next_segment_prog_date_time = current_segment_prog_date_time + vs->duration;
+                    current_segment_prog_date_time = 0.0;  /* Reset for next segment */
+                } else if (hls->flags & HLS_PROGRAM_DATE_TIME) {
+                    /* No program_date_time in playlist for this segment - calculate based on initial + durations */
+                    double prog_date_time = vs->initial_prog_date_time;
+                    HLSSegment *en;
+                    for (en = vs->segments; en; en = en->next) {
+                        prog_date_time += en->duration;
+                    }
+                    next_segment_prog_date_time = prog_date_time;
                 }
                 if (ret < 0)
                     goto fail;
                 vs->start_pos = new_start_pos;
             }
         }
+    }
+
+    /* Update initial_prog_date_time based on parsed playlist if program_date_time was found */
+    /* This ensures continuity when restarting with append_list */
+    if (hls->flags & HLS_PROGRAM_DATE_TIME && next_segment_prog_date_time > 0.0) {
+        vs->initial_prog_date_time = next_segment_prog_date_time;
+        av_log(s, AV_LOG_INFO, "Updated initial_prog_date_time from playlist to %.6f\n",
+               vs->initial_prog_date_time);
     }
 
 fail:
@@ -1860,6 +1887,31 @@ static int hls_start(AVFormatContext *s, VariantStream *vs)
         av_log(s, AV_LOG_DEBUG, "hls_start() called, resetting segment_start_pts from %"PRId64" to AV_NOPTS_VALUE\n",
                vs->segment_start_pts);
         vs->segment_start_pts = AV_NOPTS_VALUE;
+    }
+    
+    /* Calculate and store program_date_time for new segment */
+    if (c->flags & HLS_PROGRAM_DATE_TIME) {
+        HLSSegment *en;
+        HLSSegment *last_completed_segment = NULL;
+        for (en = vs->segments; en; en = en->next) {
+            last_completed_segment = en;
+        }
+        
+        if (last_completed_segment && last_completed_segment->discont_program_date_time > 0.0) {
+            /* Discontinuity case: use discont_program_date_time + duration */
+            vs->current_segment_prog_date_time = last_completed_segment->discont_program_date_time + last_completed_segment->duration;
+        } else {
+            /* Normal case: initial_prog_date_time + sum of all completed segment durations */
+            double prog_date_time = vs->initial_prog_date_time;
+            for (en = vs->segments; en; en = en->next) {
+                prog_date_time += en->duration;
+            }
+            vs->current_segment_prog_date_time = prog_date_time;
+        }
+        av_log(s, AV_LOG_DEBUG, "hls_start() set current_segment_prog_date_time=%.6f\n",
+               vs->current_segment_prog_date_time);
+    } else {
+        vs->current_segment_prog_date_time = 0.0;
     }
 
     return 0;
@@ -2447,38 +2499,11 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
     int is_keyframe = (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
     
     /* Calculate program_date_time for frame if enabled */
-    /* Compute current segment's program_date_time the same way as in playlist */
-    /* Current segment is not yet in vs->segments list (it's added when completed) */
-    /* So we compute: initial_prog_date_time + sum of all completed segment durations */
-    /* Then add frame offset to get exact frame program_date_time */
+    /* Use stored current_segment_prog_date_time (set in hls_start()) */
     char program_date_time_str[64] = "";
     if (hls->flags & HLS_PROGRAM_DATE_TIME) {
-        double current_segment_prog_date_time = 0.0;
-        HLSSegment *en;
-        
-        /* Find last completed segment to check for discontinuity */
-        HLSSegment *last_completed_segment = NULL;
-        for (en = vs->segments; en; en = en->next) {
-            last_completed_segment = en;
-        }
-        
-        /* Calculate program_date_time for current segment using same logic as playlist */
-        if (last_completed_segment && last_completed_segment->discont_program_date_time > 0.0) {
-            /* Use discont_program_date_time + duration of that segment (discontinuity case) */
-            /* This is the same calculation as in playlist when writing next segment */
-            current_segment_prog_date_time = last_completed_segment->discont_program_date_time + last_completed_segment->duration;
-        } else {
-            /* Normal case: initial_prog_date_time + sum of all completed segment durations */
-            /* This matches exactly how playlist calculates program_date_time for next segment */
-            double prog_date_time = vs->initial_prog_date_time;
-            for (en = vs->segments; en; en = en->next) {
-                prog_date_time += en->duration;
-            }
-            current_segment_prog_date_time = prog_date_time;
-        }
-        
         /* Add frame offset to get frame's program_date_time */
-        double frame_prog_date_time = current_segment_prog_date_time + time_offset;
+        double frame_prog_date_time = vs->current_segment_prog_date_time + time_offset;
         time_t tt = (time_t)frame_prog_date_time;
         int milli = av_clip(lrint(1000 * (frame_prog_date_time - tt)), 0, 999);
         struct tm *tm, tmpbuf;
@@ -2503,8 +2528,8 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
                     snprintf(program_date_time_str, sizeof(program_date_time_str), "%s.%03d%s", buf0, milli, buf1);
                 }
             }
-            av_log(s, AV_LOG_DEBUG, "Frame PDT: segment_pdt=%.6f, offset=%.6f, frame_pdt=%.6f, formatted=%s\n",
-                   current_segment_prog_date_time, time_offset, frame_prog_date_time, program_date_time_str);
+            av_log(s, AV_LOG_DEBUG, "Frame PDT: segment_pdt=%.6f (stored), offset=%.6f, frame_pdt=%.6f, formatted=%s\n",
+                   vs->current_segment_prog_date_time, time_offset, frame_prog_date_time, program_date_time_str);
         }
     }
 
@@ -2697,12 +2722,13 @@ static int hls_write_header(AVFormatContext *s)
                     continue;
                 }
 
-                vs->decoder_ctx = dec_ctx;
-                vs->decoded_frame = frame;
-                vs->sws_ctx = sws_ctx;
-                vs->frame_counter = 0;
-                vs->segment_start_pts = AV_NOPTS_VALUE;
-                av_log(s, AV_LOG_INFO, "Decoder initialized successfully for frame output\n");
+            vs->decoder_ctx = dec_ctx;
+            vs->decoded_frame = frame;
+            vs->sws_ctx = sws_ctx;
+            vs->frame_counter = 0;
+            vs->segment_start_pts = AV_NOPTS_VALUE;
+            vs->current_segment_prog_date_time = 0.0;  /* Will be set in hls_start() */
+            av_log(s, AV_LOG_INFO, "Decoder initialized successfully for frame output\n");
             }
         }
         /* Update the Codec Attr string for the mapped audio groups */
@@ -2896,8 +2922,8 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
                 } else if (vs->current_segment_final_filename_fmt[0]) {
                     seg_name = vs->current_segment_final_filename_fmt;
                 }
-                av_log(s, AV_LOG_DEBUG, "New segment started (vs->new_start), segment=%s, segment_start_pts=%"PRId64", pkt_pts=%"PRId64"\n",
-                       seg_name, vs->segment_start_pts, pkt->pts);
+                av_log(s, AV_LOG_DEBUG, "New segment started (vs->new_start), segment=%s, segment_start_pts=%"PRId64", pkt_pts=%"PRId64", current_segment_prog_date_time=%.6f\n",
+                       seg_name, vs->segment_start_pts, pkt->pts, vs->current_segment_prog_date_time);
             }
         } else {
             if (pkt->duration) {
@@ -3410,6 +3436,7 @@ static int hls_init(AVFormatContext *s)
         vs->end_pts   = AV_NOPTS_VALUE;
         vs->current_segment_final_filename_fmt[0] = '\0';
         vs->initial_prog_date_time = initial_program_date_time;
+        vs->current_segment_prog_date_time = (hls->flags & HLS_PROGRAM_DATE_TIME) ? initial_program_date_time : 0.0;
         if (hls->flags & HLS_PROGRAM_DATE_TIME) {
             time_t tt = (time_t)initial_program_date_time;
             struct tm *tm, tmpbuf;
