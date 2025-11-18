@@ -170,6 +170,7 @@ typedef struct VariantStream {
     char *m3u8_name;
 
     double initial_prog_date_time;
+    double stream_start_real_time;  /* Real time when stream started (for drift correction) */
     char current_segment_final_filename_fmt[MAX_URL_SIZE]; // when renaming segments
 
     char *fmp4_init_filename;
@@ -281,6 +282,10 @@ typedef struct HLSContext {
     /* Frame output fields */
     char *frame_output_path;      /* path to frame.raw file (NULL if not used) */
     int frame_output_interval;    /* write every Nth frame (default: 1) */
+    
+    /* PDT drift correction */
+    double pdt_drift_threshold;   /* Maximum allowed PDT drift in seconds before correction (default: 1.0) */
+    int pdt_use_realtime;         /* Use real time for each segment instead of accumulated durations (default: 0) */
 } HLSContext;
 
 static int strftime_expand(const char *fmt, char **dest)
@@ -1312,7 +1317,10 @@ static int parse_playlist(AVFormatContext *s, const char *url, VariantStream *vs
         /* Reset total_duration to 0 because initial_prog_date_time already accounts for all parsed segments */
         /* This ensures that hls_start() formula (initial + total_duration) works correctly */
         vs->total_duration = 0.0;
-        av_log(s, AV_LOG_INFO, "Updated initial_prog_date_time from playlist to %.6f, reset total_duration to 0.0\n",
+        /* Update stream_start_real_time to current time to maintain drift correction */
+        /* This ensures that elapsed_real_time calculation in hls_start() is correct */
+        vs->stream_start_real_time = av_gettime() / 1000000.0;
+        av_log(s, AV_LOG_INFO, "Updated initial_prog_date_time from playlist to %.6f, reset total_duration to 0.0, updated stream_start_real_time\n",
                vs->initial_prog_date_time);
     }
 
@@ -1895,18 +1903,57 @@ static int hls_start(AVFormatContext *s, VariantStream *vs)
     /* Calculate and store program_date_time for new segment */
     if (c->flags & HLS_PROGRAM_DATE_TIME) {
         HLSSegment *last_completed_segment = vs->last_segment;
+        double calculated_pdt;
         
         if (last_completed_segment && last_completed_segment->discont_program_date_time > 0.0) {
             /* Discontinuity case: use discont_program_date_time + duration */
-            vs->current_segment_prog_date_time = last_completed_segment->discont_program_date_time + last_completed_segment->duration;
+            calculated_pdt = last_completed_segment->discont_program_date_time + last_completed_segment->duration;
         } else {
             /* Normal case: initial_prog_date_time + total duration of all completed segments */
             /* Use vs->total_duration which is maintained by hls_append_segment() */
             /* This is O(1) instead of O(n) for infinite playlists */
-            vs->current_segment_prog_date_time = vs->initial_prog_date_time + vs->total_duration;
+            calculated_pdt = vs->initial_prog_date_time + vs->total_duration;
         }
-        av_log(s, AV_LOG_DEBUG, "hls_start() set current_segment_prog_date_time=%.6f (initial=%.6f, total_duration=%.6f)\n",
-               vs->current_segment_prog_date_time, vs->initial_prog_date_time, vs->total_duration);
+        
+        /* Option 1: Use real time for each segment (independent PDT) */
+        if (c->pdt_use_realtime) {
+            double current_real_time = av_gettime() / 1000000.0;
+            vs->current_segment_prog_date_time = current_real_time;
+            /* Update initial_prog_date_time to maintain continuity for future calculations */
+            vs->initial_prog_date_time = current_real_time - vs->total_duration;
+            av_log(s, AV_LOG_DEBUG, "hls_start() using real time for PDT: %.6f (independent segments)\n",
+                   vs->current_segment_prog_date_time);
+        } else {
+            /* Option 2: Use calculated PDT with optional drift correction */
+            if (c->pdt_drift_threshold > 0.0) {
+                /* Drift correction enabled - synchronize with real time to prevent error accumulation */
+                /* Calculate expected real time: initial_prog_date_time + elapsed real time since stream start */
+                double current_real_time = av_gettime() / 1000000.0;
+                double elapsed_real_time = current_real_time - vs->stream_start_real_time;
+                double expected_pdt = vs->initial_prog_date_time + elapsed_real_time;
+                
+                /* Use calculated PDT, but if drift exceeds threshold, sync with real time */
+                /* This prevents long-term error accumulation while maintaining short-term accuracy */
+                double drift = calculated_pdt - expected_pdt;
+                if (drift > c->pdt_drift_threshold || drift < -c->pdt_drift_threshold) {
+                    /* Significant drift detected - sync with real time */
+                    vs->current_segment_prog_date_time = expected_pdt;
+                    /* Update initial_prog_date_time to maintain continuity for future calculations */
+                    vs->initial_prog_date_time = expected_pdt - vs->total_duration;
+                    av_log(s, AV_LOG_DEBUG, "hls_start() PDT drift detected (%.3f sec, threshold=%.3f), syncing: calculated=%.6f, real_time=%.6f, adjusted=%.6f\n",
+                           drift, c->pdt_drift_threshold, calculated_pdt, expected_pdt, vs->current_segment_prog_date_time);
+                } else {
+                    vs->current_segment_prog_date_time = calculated_pdt;
+                    av_log(s, AV_LOG_DEBUG, "hls_start() set current_segment_prog_date_time=%.6f (initial=%.6f, total_duration=%.6f, drift=%.3f, threshold=%.3f)\n",
+                           vs->current_segment_prog_date_time, vs->initial_prog_date_time, vs->total_duration, drift, c->pdt_drift_threshold);
+                }
+            } else {
+                /* Drift correction disabled - use calculated PDT as-is (original behavior) */
+                vs->current_segment_prog_date_time = calculated_pdt;
+                av_log(s, AV_LOG_DEBUG, "hls_start() set current_segment_prog_date_time=%.6f (initial=%.6f, total_duration=%.6f, drift correction disabled)\n",
+                       vs->current_segment_prog_date_time, vs->initial_prog_date_time, vs->total_duration);
+            }
+        }
     } else {
         vs->current_segment_prog_date_time = 0.0;
     }
@@ -3433,6 +3480,7 @@ static int hls_init(AVFormatContext *s)
         vs->end_pts   = AV_NOPTS_VALUE;
         vs->current_segment_final_filename_fmt[0] = '\0';
         vs->initial_prog_date_time = initial_program_date_time;
+        vs->stream_start_real_time = av_gettime() / 1000000.0;  /* Store real time at stream start */
         vs->current_segment_prog_date_time = (hls->flags & HLS_PROGRAM_DATE_TIME) ? initial_program_date_time : 0.0;
         if (hls->flags & HLS_PROGRAM_DATE_TIME) {
             time_t tt = (time_t)initial_program_date_time;
@@ -3650,6 +3698,8 @@ static const AVOption options[] = {
     {"headers", "set custom HTTP headers, can override built in default headers", OFFSET(headers), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
     {"hls_frame_output", "path to write current frame as BGR raw data", OFFSET(frame_output_path), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     {"hls_frame_interval", "write every Nth frame (default: 1)", OFFSET(frame_output_interval), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, E},
+    {"hls_pdt_drift_threshold", "maximum allowed PDT drift in seconds before correction (default: 1.0, 0 to disable)", OFFSET(pdt_drift_threshold), AV_OPT_TYPE_DOUBLE, {.dbl = 1.0}, 0.0, 3600.0, E},
+    {"hls_pdt_use_realtime", "use real time for each segment instead of accumulated durations (default: 0)", OFFSET(pdt_use_realtime), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, E},
     { NULL },
 };
 
