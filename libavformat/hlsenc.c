@@ -94,6 +94,7 @@ typedef struct HLSSegment {
 
     struct HLSSegment *next;
     double discont_program_date_time;
+    double program_date_time;  /* Program date time for this segment (0.0 if not set) */
 } HLSSegment;
 
 typedef enum HLSFlags {
@@ -1103,6 +1104,7 @@ static int hls_append_segment(struct AVFormatContext *s, HLSContext *hls,
     en->duration = duration;
     en->pos      = pos;
     en->size     = size;
+    en->program_date_time = 0.0;  /* Will be set when segment is completed */
     en->keyframe_pos      = vs->video_keyframe_pos;
     en->keyframe_size     = vs->video_keyframe_size;
     en->next     = NULL;
@@ -1656,11 +1658,25 @@ static int hls_window(AVFormatContext *s, int last, VariantStream *vs)
                                    hls->flags & HLS_SINGLE_FILE, vs->init_range_length, 0);
         }
 
+        /* Use segment's program_date_time if set (e.g., from pdt_use_realtime),
+         * otherwise use discont_program_date_time if set, otherwise use calculated prog_date_time_p */
+        double segment_pdt_temp;  /* Temporary variable for segments with fixed PDT */
+        double *segment_pdt_p = NULL;
+        if (en->program_date_time > 0.0) {
+            /* Use temporary variable to avoid modifying en->program_date_time */
+            segment_pdt_temp = en->program_date_time;
+            segment_pdt_p = &segment_pdt_temp;
+        } else if (en->discont_program_date_time > 0.0) {
+            segment_pdt_p = &en->discont_program_date_time;
+        } else {
+            segment_pdt_p = prog_date_time_p;
+        }
+        
         ret = ff_hls_write_file_entry(byterange_mode ? hls->m3u8_out : vs->out, en->discont, byterange_mode,
                                       en->duration, hls->flags & HLS_ROUND_DURATIONS,
                                       en->size, en->pos, hls->baseurl,
                                       en->filename,
-                                      en->discont_program_date_time ? &en->discont_program_date_time : prog_date_time_p,
+                                      segment_pdt_p,
                                       en->keyframe_size, en->keyframe_pos, hls->flags & HLS_I_FRAMES_ONLY);
         if (en->discont_program_date_time)
             en->discont_program_date_time -= en->duration;
@@ -3105,6 +3121,13 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
             av_freep(&old_filename);
             return ret;
         }
+        
+        /* Save current_segment_prog_date_time to segment if it was set */
+        if ((hls->flags & HLS_PROGRAM_DATE_TIME) && vs->current_segment_prog_date_time > 0.0) {
+            vs->last_segment->program_date_time = vs->current_segment_prog_date_time;
+            av_log(s, AV_LOG_DEBUG, "Saved segment PDT: %.6f to segment %s\n",
+                   vs->current_segment_prog_date_time, vs->last_segment->filename);
+        }
 
         // if we're building a VOD playlist, skip writing the manifest multiple times, and just wait until the end
         if (hls->pl_type != PLAYLIST_TYPE_VOD) {
@@ -3348,6 +3371,13 @@ failed:
 
         /* after av_write_trailer, then duration + 1 duration per packet */
         hls_append_segment(s, hls, vs, vs->duration + vs->dpp, vs->start_pos, vs->size);
+        
+        /* Save current_segment_prog_date_time to final segment if it was set */
+        if ((hls->flags & HLS_PROGRAM_DATE_TIME) && vs->current_segment_prog_date_time > 0.0) {
+            vs->last_segment->program_date_time = vs->current_segment_prog_date_time;
+            av_log(s, AV_LOG_DEBUG, "Saved final segment PDT: %.6f to segment %s\n",
+                   vs->current_segment_prog_date_time, vs->last_segment->filename);
+        }
 
         sls_flag_file_rename(hls, vs, old_filename);
 
