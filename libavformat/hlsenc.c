@@ -1309,7 +1309,10 @@ static int parse_playlist(AVFormatContext *s, const char *url, VariantStream *vs
     /* This ensures continuity when restarting with append_list */
     if (hls->flags & HLS_PROGRAM_DATE_TIME && next_segment_prog_date_time > 0.0) {
         vs->initial_prog_date_time = next_segment_prog_date_time;
-        av_log(s, AV_LOG_INFO, "Updated initial_prog_date_time from playlist to %.6f\n",
+        /* Reset total_duration to 0 because initial_prog_date_time already accounts for all parsed segments */
+        /* This ensures that hls_start() formula (initial + total_duration) works correctly */
+        vs->total_duration = 0.0;
+        av_log(s, AV_LOG_INFO, "Updated initial_prog_date_time from playlist to %.6f, reset total_duration to 0.0\n",
                vs->initial_prog_date_time);
     }
 
@@ -1891,25 +1894,19 @@ static int hls_start(AVFormatContext *s, VariantStream *vs)
     
     /* Calculate and store program_date_time for new segment */
     if (c->flags & HLS_PROGRAM_DATE_TIME) {
-        HLSSegment *en;
-        HLSSegment *last_completed_segment = NULL;
-        for (en = vs->segments; en; en = en->next) {
-            last_completed_segment = en;
-        }
+        HLSSegment *last_completed_segment = vs->last_segment;
         
         if (last_completed_segment && last_completed_segment->discont_program_date_time > 0.0) {
             /* Discontinuity case: use discont_program_date_time + duration */
             vs->current_segment_prog_date_time = last_completed_segment->discont_program_date_time + last_completed_segment->duration;
         } else {
-            /* Normal case: initial_prog_date_time + sum of all completed segment durations */
-            double prog_date_time = vs->initial_prog_date_time;
-            for (en = vs->segments; en; en = en->next) {
-                prog_date_time += en->duration;
-            }
-            vs->current_segment_prog_date_time = prog_date_time;
+            /* Normal case: initial_prog_date_time + total duration of all completed segments */
+            /* Use vs->total_duration which is maintained by hls_append_segment() */
+            /* This is O(1) instead of O(n) for infinite playlists */
+            vs->current_segment_prog_date_time = vs->initial_prog_date_time + vs->total_duration;
         }
-        av_log(s, AV_LOG_DEBUG, "hls_start() set current_segment_prog_date_time=%.6f\n",
-               vs->current_segment_prog_date_time);
+        av_log(s, AV_LOG_DEBUG, "hls_start() set current_segment_prog_date_time=%.6f (initial=%.6f, total_duration=%.6f)\n",
+               vs->current_segment_prog_date_time, vs->initial_prog_date_time, vs->total_duration);
     } else {
         vs->current_segment_prog_date_time = 0.0;
     }
