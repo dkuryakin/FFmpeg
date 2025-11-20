@@ -94,6 +94,7 @@ typedef struct HLSSegment {
 
     struct HLSSegment *next;
     double discont_program_date_time;
+    double program_date_time; /* Program Date Time for this segment, computed once to avoid rounding errors */
 } HLSSegment;
 
 typedef enum HLSFlags {
@@ -155,9 +156,10 @@ typedef struct VariantStream {
     int reference_stream_index;
 
     int64_t total_size;
-    double total_duration;
+    double total_duration;       /* Sum of durations of all segments in playlist (including history) */
+    double run_total_duration;   /* Sum of durations of segments created in current encoder run only */
+    int64_t max_bitrate;         /* Maximum bitrate observed across segments (for master playlist) */
     int64_t avg_bitrate;
-    int64_t max_bitrate;
 
     HLSSegment *segments;
     HLSSegment *last_segment;
@@ -170,6 +172,7 @@ typedef struct VariantStream {
     char *m3u8_name;
 
     double initial_prog_date_time;
+    double stream_start_time; /* Real time when first segment was created, for accurate PDT calculation */
     char current_segment_final_filename_fmt[MAX_URL_SIZE]; // when renaming segments
 
     char *fmp4_init_filename;
@@ -194,6 +197,9 @@ typedef struct VariantStream {
     const char *ccgroup;  /* closed caption group name */
     const char *varname;  /* variant name */
     const char *subtitle_varname;  /* subtitle variant name */
+
+    double current_segment_pdt; /* PDT of the currently open segment (start time) */
+    int    restoring_from_playlist; /* non-zero while parse_playlist() is rebuilding segments */
 
     /* Frame output fields */
     AVCodecContext *decoder_ctx;  /* decoder context for video stream */
@@ -1061,6 +1067,12 @@ static int hls_append_segment(struct AVFormatContext *s, HLSContext *hls,
 
     vs->total_size += size;
     vs->total_duration += duration;
+    /* run_total_duration tracks only segments created in current encoder run.
+     * Segments restored from an existing playlist (parse_playlist) should not
+     * contribute here, otherwise restarts would shift PDT forward by the full
+     * historical duration instead of only by real downtime. */
+    if (!vs->restoring_from_playlist)
+        vs->run_total_duration += duration;
     if (duration > 0.5) {
         // Don't include the final, possibly very short segment in the
         // calculation of the max bitrate.
@@ -1102,6 +1114,7 @@ static int hls_append_segment(struct AVFormatContext *s, HLSContext *hls,
     en->next     = NULL;
     en->discont  = 0;
     en->discont_program_date_time = 0;
+    en->program_date_time = 0;
 
     if (vs->discontinuity) {
         en->discont = 1;
@@ -1111,6 +1124,13 @@ static int hls_append_segment(struct AVFormatContext *s, HLSContext *hls,
     if (hls->key_info_file || hls->encrypt) {
         av_strlcpy(en->key_uri, vs->key_uri, sizeof(en->key_uri));
         av_strlcpy(en->iv_string, vs->iv_string, sizeof(en->iv_string));
+    }
+
+    /* For new code we prefer to base segment PDT on the value captured at segment
+     * start (current_segment_pdt), to keep it consistent for all frames within
+     * the segment and avoid recomputing from wall-clock here. */
+    if (hls->flags & HLS_PROGRAM_DATE_TIME && vs->current_segment_pdt > 0.0) {
+        en->program_date_time = vs->current_segment_pdt;
     }
 
     if (!vs->segments)
@@ -1187,6 +1207,11 @@ static int parse_playlist(AVFormatContext *s, const char *url, VariantStream *vs
     }
 
     vs->discontinuity = 0;
+    /* Mark that we're rebuilding segments from an existing playlist.
+     * These historical segments must not affect run_total_duration, which
+     * is used to anchor PDT of new segments to the current wall-clock time
+     * after a restart. */
+    vs->restoring_from_playlist = 1;
     while (!avio_feof(in)) {
         ff_get_chomp_line(in, line, sizeof(line));
         if (av_strstart(line, "#EXT-X-MEDIA-SEQUENCE:", &ptr)) {
@@ -1277,6 +1302,10 @@ static int parse_playlist(AVFormatContext *s, const char *url, VariantStream *vs
                 ret = hls_append_segment(s, hls, vs, vs->duration, vs->start_pos, vs->size);
                 if (discont_program_date_time) {
                     vs->last_segment->discont_program_date_time = discont_program_date_time;
+                    /* Update stored program_date_time to match discontinuity PDT */
+                    if (hls->flags & HLS_PROGRAM_DATE_TIME) {
+                        vs->last_segment->program_date_time = discont_program_date_time;
+                    }
                     discont_program_date_time += vs->duration;
                 }
                 if (ret < 0)
@@ -1287,6 +1316,8 @@ static int parse_playlist(AVFormatContext *s, const char *url, VariantStream *vs
     }
 
 fail:
+    /* We are done restoring from playlist (both in success and error cases). */
+    vs->restoring_from_playlist = 0;
     avio_close(in);
     return ret;
 }
@@ -1300,6 +1331,47 @@ static void hls_free_segments(HLSSegment *p)
         p = p->next;
         av_freep(&en);
     }
+}
+
+/* Format a timestamp (seconds since epoch, fractional) into ISO-8601-like
+ * string used by HLS PDT, e.g. 2025-01-01T12:34:56.789+0300 */
+static int format_pdt_timestamp(double time_sec, char *buf, size_t buf_size)
+{
+    time_t tt, wrongsecs;
+    int milli;
+    struct tm *tm, tmpbuf;
+    char datebuf[128], tzbuf[128];
+
+    tt = (int64_t)time_sec;
+    milli = av_clip(lrint(1000 * (time_sec - tt)), 0, 999);
+
+    tm = localtime_r(&tt, &tmpbuf);
+    if (!tm)
+        return AVERROR_UNKNOWN;
+
+    if (!strftime(datebuf, sizeof(datebuf), "%Y-%m-%dT%H:%M:%S", tm))
+        return AVERROR_UNKNOWN;
+
+    if (!strftime(tzbuf, sizeof(tzbuf), "%z", tm) || tzbuf[1] < '0' || tzbuf[1] > '2') {
+        int tz_min, dst = tm->tm_isdst;
+
+        tm = gmtime_r(&tt, &tmpbuf);
+        if (!tm)
+            return AVERROR_UNKNOWN;
+        tm->tm_isdst = dst;
+        wrongsecs = mktime(tm);
+        tz_min = (FFABS(wrongsecs - tt) + 30) / 60;
+        snprintf(tzbuf, sizeof(tzbuf),
+                 "%c%02d%02d",
+                 wrongsecs <= tt ? '+' : '-',
+                 tz_min / 60,
+                 tz_min % 60);
+    }
+
+    if (snprintf(buf, buf_size, "%s.%03d%s", datebuf, milli, tzbuf) <= 0)
+        return AVERROR_UNKNOWN;
+
+    return 0;
 }
 
 static int hls_rename_temp_file(AVFormatContext *s, AVFormatContext *oc)
@@ -1618,11 +1690,27 @@ static int hls_window(AVFormatContext *s, int last, VariantStream *vs)
                                    hls->flags & HLS_SINGLE_FILE, vs->init_range_length, 0);
         }
 
+        /* Use stored PDT if available to avoid rounding errors on long playlists */
+        double *segment_pdt = NULL;
+        double stored_pdt_temp = 0;
+        if (hls->flags & HLS_PROGRAM_DATE_TIME) {
+            if (en->discont_program_date_time) {
+                /* Use discontinuity PDT if set */
+                segment_pdt = &en->discont_program_date_time;
+            } else if (en->program_date_time > 0) {
+                /* Use stored PDT computed when segment was created (avoids rounding errors) */
+                stored_pdt_temp = en->program_date_time;
+                segment_pdt = &stored_pdt_temp;
+            } else {
+                /* Fall back to computed PDT for backward compatibility (old segments without stored PDT) */
+                segment_pdt = prog_date_time_p;
+            }
+        }
         ret = ff_hls_write_file_entry(byterange_mode ? hls->m3u8_out : vs->out, en->discont, byterange_mode,
                                       en->duration, hls->flags & HLS_ROUND_DURATIONS,
                                       en->size, en->pos, hls->baseurl,
                                       en->filename,
-                                      en->discont_program_date_time ? &en->discont_program_date_time : prog_date_time_p,
+                                      segment_pdt,
                                       en->keyframe_size, en->keyframe_pos, hls->flags & HLS_I_FRAMES_ONLY);
         if (en->discont_program_date_time)
             en->discont_program_date_time -= en->duration;
@@ -2406,12 +2494,47 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
     if (vs->segment_start_pts != AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE) {
         int64_t pts_diff = pkt->pts - vs->segment_start_pts;
         time_offset = (double)pts_diff * time_base.num / time_base.den;
-        av_log(s, AV_LOG_DEBUG, "Frame time offset: segment=%s, pkt_pts=%"PRId64", segment_start_pts=%"PRId64", pts_diff=%"PRId64", time_offset=%.6f\n",
+        av_log(s, AV_LOG_DEBUG,
+               "Frame time offset: segment=%s, pkt_pts=%"PRId64", segment_start_pts=%"PRId64", pts_diff=%"PRId64", time_offset=%.6f\n",
                segment_name, pkt->pts, vs->segment_start_pts, pts_diff, time_offset);
     } else {
-        av_log(s, AV_LOG_WARNING, "Frame time offset: segment=%s, pkt_pts=%"PRId64", segment_start_pts=%"PRId64", time_offset=0.0 (using default)\n",
+        av_log(s, AV_LOG_WARNING,
+               "Frame time offset: segment=%s, pkt_pts=%"PRId64", segment_start_pts=%"PRId64", time_offset=0.0 (using default)\n",
                segment_name, pkt->pts, vs->segment_start_pts);
         time_offset = 0.0; // Default to 0 if PTS is not available
+    }
+
+    /* Calculate program date time for the frame (segment PDT + time offset) and current time in PDT format */
+    char   program_date_time_str[128] = { 0 };
+    char   now_time_str[128]      = { 0 };
+    double program_date_time_sec  = 0.0;
+
+    if (hls->flags & HLS_PROGRAM_DATE_TIME) {
+        double base_pdt = vs->current_segment_pdt;
+        double now_sec  = av_gettime() / 1000000.0;
+
+        if (base_pdt <= 0.0) {
+            /* Fallback: derive base PDT from run_total_duration (time since
+             * encoder start), not from full historical total_duration. This
+             * keeps program_date_time anchored to the current encoder run rather
+             * than to the entire playlist history. */
+            base_pdt = vs->initial_prog_date_time + vs->run_total_duration;
+        }
+
+        program_date_time_sec = base_pdt + time_offset;
+
+        if (format_pdt_timestamp(program_date_time_sec, program_date_time_str, sizeof(program_date_time_str)) < 0) {
+            av_log(s, AV_LOG_WARNING, "Failed to format program_date_time timestamp\n");
+            program_date_time_str[0] = '\0';
+        }
+        if (format_pdt_timestamp(now_sec, now_time_str, sizeof(now_time_str)) < 0) {
+            av_log(s, AV_LOG_WARNING, "Failed to format now timestamp\n");
+            now_time_str[0] = '\0';
+        }
+
+        av_log(s, AV_LOG_DEBUG,
+               "Frame program_date_time: segment_pdt=%.6f, time_offset=%.6f, program_date_time=%.6f\n",
+               base_pdt, time_offset, program_date_time_sec);
     }
 
     /* Calculate additional metadata */
@@ -2457,14 +2580,29 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
         return 0;
     }
 
-    /* Write metadata as single line with key=value format: name=xxx.ts,offset=0.123,width=1920,height=1080,fps=30.000,bitrate=5000000,pts=123456,is_keyframe=1 */
-    if (fprintf(fp, "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
-                segment_name, time_offset, frame->width, frame->height,
-                fps, bitrate, pts, is_keyframe) < 0) {
-        av_log(s, AV_LOG_WARNING, "Error writing metadata to %s\n", temp_path);
-        fclose(fp);
-        unlink(temp_path);
-        return 0;
+    /* Write metadata as single line with key=value format:
+     * name=...,offset=...,program_date_time=...,now=...,width=...,height=...,fps=...,bitrate=...,pts=...,is_keyframe=... */
+    if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
+        if (fprintf(fp,
+                    "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
+                    segment_name, time_offset, program_date_time_str, now_time_str,
+                    frame->width, frame->height, fps, bitrate, pts, is_keyframe) < 0) {
+            av_log(s, AV_LOG_WARNING, "Error writing metadata to %s\n", temp_path);
+            fclose(fp);
+            unlink(temp_path);
+            return 0;
+        }
+    } else {
+        /* Fallback: write legacy format without program_date_time/now */
+        if (fprintf(fp,
+                    "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
+                    segment_name, time_offset, frame->width, frame->height,
+                    fps, bitrate, pts, is_keyframe) < 0) {
+            av_log(s, AV_LOG_WARNING, "Error writing metadata to %s\n", temp_path);
+            fclose(fp);
+            unlink(temp_path);
+            return 0;
+        }
     }
 
     /* Write BGR data - written in one chunk for optimal performance */
@@ -2753,17 +2891,24 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
         vs->start_pts = pkt->pts;
         if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
             vs->start_pts_from_audio = 1;
-        /* Initialize segment start PTS for frame output */
+        /* Initialize segment start PTS and PDT for frame output.
+         * PDT is derived from accumulated segment durations, not wall clock. */
         if (hls->frame_output_path && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            vs->segment_start_pts = pkt->pts;
+            vs->segment_start_pts   = pkt->pts;
+            if (hls->flags & HLS_PROGRAM_DATE_TIME)
+                vs->current_segment_pdt = vs->initial_prog_date_time + vs->run_total_duration;
         }
     }
-    if (vs->start_pts_from_audio && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && vs->start_pts > pkt->pts) {
+    if (vs->start_pts_from_audio &&
+        st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+        vs->start_pts > pkt->pts) {
         vs->start_pts = pkt->pts;
         vs->start_pts_from_audio = 0;
-        /* Update segment start PTS for frame output */
+        /* Update segment start PTS and PDT for frame output */
         if (hls->frame_output_path) {
             vs->segment_start_pts = pkt->pts;
+            if (hls->flags & HLS_PROGRAM_DATE_TIME)
+                vs->current_segment_pdt = vs->initial_prog_date_time + vs->run_total_duration;
         }
     }
 
@@ -2813,16 +2958,21 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
             vs->duration = (double)(pkt->pts - vs->end_pts)
                                        * st->time_base.num / st->time_base.den;
             vs->dpp = (double)(pkt->duration) * st->time_base.num / st->time_base.den;
-            /* Update segment start PTS for frame output when new segment starts */
+            /* Update segment start PTS and PDT for frame output when new segment starts */
             if (hls->frame_output_path && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-                vs->segment_start_pts = pkt->pts;
                 const char *seg_name = "unknown";
+
+                vs->segment_start_pts = pkt->pts;
+                if (hls->flags & HLS_PROGRAM_DATE_TIME)
+                    vs->current_segment_pdt = vs->initial_prog_date_time + vs->run_total_duration;
+
                 if (vs->avf->url && vs->avf->url[0]) {
                     seg_name = av_basename(vs->avf->url);
                 } else if (vs->current_segment_final_filename_fmt[0]) {
                     seg_name = vs->current_segment_final_filename_fmt;
                 }
-                av_log(s, AV_LOG_DEBUG, "New segment started (vs->new_start), segment=%s, segment_start_pts=%"PRId64", pkt_pts=%"PRId64"\n",
+                av_log(s, AV_LOG_DEBUG,
+                       "New segment started (vs->new_start), segment=%s, segment_start_pts=%"PRId64", pkt_pts=%"PRId64"\n",
                        seg_name, vs->segment_start_pts, pkt->pts);
             }
         } else {
@@ -3006,18 +3156,25 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
             ret = hls_start(s, vs);
         }
         
-        /* Update segment start PTS for frame output AFTER hls_start() */
-        /* hls_start() resets segment_start_pts to AV_NOPTS_VALUE and sets vs->new_start = 1 */
-        /* We need to update it with the PTS of the packet that caused the split */
+        /* Update segment start PTS and PDT for frame output AFTER hls_start().
+         * hls_start() resets segment_start_pts to AV_NOPTS_VALUE and sets vs->new_start = 1.
+         * We need to update it with the PTS of the packet that caused the split. */
         if (hls->frame_output_path && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            vs->segment_start_pts = pkt->pts;
             const char *new_seg_name = "unknown";
+
+            vs->segment_start_pts = pkt->pts;
+            if (hls->flags & HLS_PROGRAM_DATE_TIME)
+                /* After hls_start(), we want PDT of the new segment to be based on
+                 * the current encoder run time, not the full playlist history. */
+                vs->current_segment_pdt = vs->initial_prog_date_time + vs->run_total_duration;
+
             if (vs->avf->url && vs->avf->url[0]) {
                 new_seg_name = av_basename(vs->avf->url);
             } else if (vs->current_segment_final_filename_fmt[0]) {
                 new_seg_name = vs->current_segment_final_filename_fmt;
             }
-            av_log(s, AV_LOG_DEBUG, "After hls_start(), updated segment_start_pts=%"PRId64" for new segment=%s (pkt_pts=%"PRId64")\n",
+            av_log(s, AV_LOG_DEBUG,
+                   "After hls_start(), updated segment_start_pts=%"PRId64" for new segment=%s (pkt_pts=%"PRId64")\n",
                    vs->segment_start_pts, new_seg_name, pkt->pts);
         }
         
@@ -3332,11 +3489,16 @@ static int hls_init(AVFormatContext *s)
         if (ret < 0)
             return ret;
 
-        vs->sequence  = hls->start_sequence;
-        vs->start_pts = AV_NOPTS_VALUE;
-        vs->end_pts   = AV_NOPTS_VALUE;
+        vs->sequence           = hls->start_sequence;
+        vs->start_pts          = AV_NOPTS_VALUE;
+        vs->end_pts            = AV_NOPTS_VALUE;
         vs->current_segment_final_filename_fmt[0] = '\0';
-        vs->initial_prog_date_time = initial_program_date_time;
+        vs->initial_prog_date_time       = initial_program_date_time;
+        vs->stream_start_time            = 0;      /* Will be set when first segment is created */
+        vs->current_segment_pdt          = 0.0;    /* Will be set when first segment starts */
+        vs->run_total_duration           = 0.0;    /* Duration within current encoder run */
+        vs->restoring_from_playlist      = 0;
+        vs->max_bitrate                  = 0;
 
         for (j = 0; j < vs->nb_streams; j++) {
             vs->has_video += vs->streams[j]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
