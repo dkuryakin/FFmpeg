@@ -208,6 +208,7 @@ typedef struct VariantStream {
     uint8_t *bgr_buffer;          /* buffer for BGR data */
     int bgr_linesize[1];          /* line size for BGR buffer */
     int frame_counter;            /* frame counter for interval writing */
+    int frame_meta_counter;       /* frame counter for metadata interval writing */
     int64_t segment_start_pts;    /* PTS of current segment start */
 } VariantStream;
 
@@ -284,8 +285,11 @@ typedef struct HLSContext {
     int has_video_m3u8; /* has video stream m3u8 list */
 
     /* Frame output fields */
-    char *frame_output_path;      /* path to frame.raw file (NULL if not used) */
-    int frame_output_interval;    /* write every Nth frame (default: 1) */
+    char *frame_output_path;       /* path to frame.raw file (NULL if not used) */
+    int   frame_output_interval;   /* write every Nth frame (default: 1) */
+    char *frame_meta_output_path;  /* path to frame metadata file (NULL if not used) */
+    int   frame_meta_interval;     /* write metadata every Nth frame (default: 1) */
+    FILE *frame_meta_fp;           /* file handle for frame metadata output (NULL if not used) */
 } HLSContext;
 
 static int strftime_expand(const char *fmt, char **dest)
@@ -2633,6 +2637,39 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
     av_log(s, AV_LOG_DEBUG, "Frame written successfully to %s (segment: %s, offset: %.6f, size: %d, pkt_pts=%"PRId64", segment_start_pts=%"PRId64")\n",
            hls->frame_output_path, segment_name, time_offset, bgr_size, pkt->pts, vs->segment_start_pts);
 
+    /* Write metadata to separate file if enabled.
+     * Open the metadata file lazily on first use and keep it open for the
+     * whole muxer lifetime so that writes are buffered by stdio. */
+    if (hls->frame_meta_output_path && hls->frame_meta_interval > 0) {
+        vs->frame_meta_counter++;
+        if (vs->frame_meta_counter % hls->frame_meta_interval == 0) {
+            FILE *meta_fp = hls->frame_meta_fp;
+
+            if (!meta_fp) {
+                meta_fp = avpriv_fopen_utf8(hls->frame_meta_output_path, "a");
+                if (!meta_fp) {
+                    av_log(s, AV_LOG_WARNING, "Error opening metadata file %s for append: %s\n",
+                           hls->frame_meta_output_path, strerror(errno));
+                    /* Don't retry endlessly on every frame if opening failed */
+                    return 0;
+                }
+                hls->frame_meta_fp = meta_fp;
+            }
+
+            if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
+                fprintf(meta_fp,
+                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
+                        segment_name, time_offset, program_date_time_str, now_time_str,
+                        frame->width, frame->height, fps, bitrate, pts, is_keyframe);
+            } else {
+                fprintf(meta_fp,
+                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
+                        segment_name, time_offset, frame->width, frame->height,
+                        fps, bitrate, pts, is_keyframe);
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -2766,6 +2803,7 @@ static int hls_write_header(AVFormatContext *s)
                 vs->decoded_frame = frame;
                 vs->sws_ctx = sws_ctx;
                 vs->frame_counter = 0;
+                vs->frame_meta_counter = 0;
                 vs->segment_start_pts = AV_NOPTS_VALUE;
                 av_log(s, AV_LOG_INFO, "Decoder initialized successfully for frame output\n");
             }
@@ -3239,8 +3277,14 @@ static void hls_deinit(AVFormatContext *s)
     ff_format_io_close(s, &hls->m3u8_out);
     ff_format_io_close(s, &hls->sub_m3u8_out);
     ff_format_io_close(s, &hls->http_delete);
+    if (hls->frame_meta_fp) {
+        fflush(hls->frame_meta_fp);
+        fclose(hls->frame_meta_fp);
+        hls->frame_meta_fp = NULL;
+    }
     av_freep(&hls->key_basename);
     av_freep(&hls->frame_output_path);
+    av_freep(&hls->frame_meta_output_path);
     av_freep(&hls->var_streams);
     av_freep(&hls->cc_streams);
     av_freep(&hls->master_m3u8_url);
@@ -3705,6 +3749,8 @@ static const AVOption options[] = {
     {"headers", "set custom HTTP headers, can override built in default headers", OFFSET(headers), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
     {"hls_frame_output", "path to write current frame as BGR raw data", OFFSET(frame_output_path), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     {"hls_frame_interval", "write every Nth frame (default: 1)", OFFSET(frame_output_interval), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, E},
+    {"hls_frame_meta_output", "path to write frame metadata (append mode)", OFFSET(frame_meta_output_path), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
+    {"hls_frame_meta_interval", "write metadata every Nth frame (default: 1)", OFFSET(frame_meta_interval), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, E},
     { NULL },
 };
 
