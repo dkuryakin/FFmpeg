@@ -285,11 +285,17 @@ typedef struct HLSContext {
     int has_video_m3u8; /* has video stream m3u8 list */
 
     /* Frame output fields */
-    char *frame_output_path;       /* path to frame.raw file (NULL if not used) */
-    int   frame_output_interval;   /* write every Nth frame (default: 1) */
-    char *frame_meta_output_path;  /* path to frame metadata file (NULL if not used) */
-    int   frame_meta_interval;     /* write metadata every Nth frame (default: 1) */
-    FILE *frame_meta_fp;           /* file handle for frame metadata output (NULL if not used) */
+    char   *frame_output_path;        /* path to frame.raw file (NULL if not used) */
+    int     frame_output_interval;    /* write every Nth frame (default: 1) */
+    char   *frame_meta_output_path;   /* path to frame metadata file (NULL if not used) */
+    int     frame_meta_interval;      /* write metadata every Nth frame (default: 1) */
+    FILE   *frame_meta_fp;           /* file handle for frame metadata output (NULL if not used) */
+
+    /* Frame buffer fields (circular buffer of last N frames) */
+    char   *frame_buffer_output;      /* printf-style template for numbered frame files, e.g. /path/frame_%09d.raw */
+    int     frame_buffer_interval;    /* write every Nth frame to the buffer (default: 1) */
+    int     frame_buffer_size;        /* how many latest frames to keep (0 = unlimited) */
+    int64_t frame_buffer_index;       /* global counter of frames written to buffer */
 } HLSContext;
 
 static int strftime_expand(const char *fmt, char **dest)
@@ -2571,71 +2577,74 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
     }
     
     int64_t pts = pkt->pts;
-    int is_keyframe = (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
+    int     is_keyframe = (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
 
-    /* Create temporary file path */
-    snprintf(temp_path, sizeof(temp_path), "%s.tmp", hls->frame_output_path);
+    /* Write single latest frame if enabled (legacy hls_frame_output). */
+    if (hls->frame_output_path) {
+        /* Create temporary file path */
+        snprintf(temp_path, sizeof(temp_path), "%s.tmp", hls->frame_output_path);
 
-    /* Write to temporary file atomically */
-    fp = avpriv_fopen_utf8(temp_path, "wb");
-    if (!fp) {
-        av_log(s, AV_LOG_WARNING, "Error opening temporary file %s: %s\n",
-               temp_path, strerror(errno));
-        return 0;
-    }
+        /* Write to temporary file atomically */
+        fp = avpriv_fopen_utf8(temp_path, "wb");
+        if (!fp) {
+            av_log(s, AV_LOG_WARNING, "Error opening temporary file %s: %s\n",
+                   temp_path, strerror(errno));
+            return 0;
+        }
 
-    /* Write metadata as single line with key=value format:
-     * name=...,offset=...,program_date_time=...,now=...,width=...,height=...,fps=...,bitrate=...,pts=...,is_keyframe=... */
-    if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
-        if (fprintf(fp,
-                    "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
-                    segment_name, time_offset, program_date_time_str, now_time_str,
-                    frame->width, frame->height, fps, bitrate, pts, is_keyframe) < 0) {
-            av_log(s, AV_LOG_WARNING, "Error writing metadata to %s\n", temp_path);
+        /* Write metadata as single line with key=value format:
+         * name=...,offset=...,program_date_time=...,now=...,width=...,height=...,fps=...,bitrate=...,pts=...,is_keyframe=... */
+        if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
+            if (fprintf(fp,
+                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
+                        segment_name, time_offset, program_date_time_str, now_time_str,
+                        frame->width, frame->height, fps, bitrate, pts, is_keyframe) < 0) {
+                av_log(s, AV_LOG_WARNING, "Error writing metadata to %s\n", temp_path);
+                fclose(fp);
+                unlink(temp_path);
+                return 0;
+            }
+        } else {
+            /* Fallback: write legacy format without program_date_time/now */
+            if (fprintf(fp,
+                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
+                        segment_name, time_offset, frame->width, frame->height,
+                        fps, bitrate, pts, is_keyframe) < 0) {
+                av_log(s, AV_LOG_WARNING, "Error writing metadata to %s\n", temp_path);
+                fclose(fp);
+                unlink(temp_path);
+                return 0;
+            }
+        }
+
+        /* Write BGR data - written in one chunk for optimal performance */
+        if (fwrite(vs->bgr_buffer, 1, bgr_size, fp) != bgr_size) {
+            av_log(s, AV_LOG_WARNING, "Error writing BGR data to %s\n", temp_path);
             fclose(fp);
             unlink(temp_path);
             return 0;
         }
-    } else {
-        /* Fallback: write legacy format without program_date_time/now */
-        if (fprintf(fp,
-                    "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
-                    segment_name, time_offset, frame->width, frame->height,
-                    fps, bitrate, pts, is_keyframe) < 0) {
-            av_log(s, AV_LOG_WARNING, "Error writing metadata to %s\n", temp_path);
-            fclose(fp);
+        
+        /* Flush to ensure all data is written before closing */
+        fflush(fp);
+
+        if (fclose(fp) != 0) {
+            av_log(s, AV_LOG_WARNING, "Error closing temporary file %s\n", temp_path);
             unlink(temp_path);
             return 0;
         }
-    }
 
-    /* Write BGR data - written in one chunk for optimal performance */
-    if (fwrite(vs->bgr_buffer, 1, bgr_size, fp) != bgr_size) {
-        av_log(s, AV_LOG_WARNING, "Error writing BGR data to %s\n", temp_path);
-        fclose(fp);
-        unlink(temp_path);
-        return 0;
-    }
-    
-    /* Flush to ensure all data is written before closing */
-    fflush(fp);
+        /* Atomically rename */
+        if (rename(temp_path, hls->frame_output_path) < 0) {
+            av_log(s, AV_LOG_WARNING, "Error renaming %s to %s: %s\n",
+                   temp_path, hls->frame_output_path, strerror(errno));
+            unlink(temp_path);
+            return 0;
+        }
 
-    if (fclose(fp) != 0) {
-        av_log(s, AV_LOG_WARNING, "Error closing temporary file %s\n", temp_path);
-        unlink(temp_path);
-        return 0;
+        av_log(s, AV_LOG_DEBUG, "Frame written successfully to %s (segment: %s, offset: %.6f, size: %d, pkt_pts=%"PRId64", segment_start_pts=%"PRId64")\n",
+               hls->frame_output_path, segment_name, time_offset, bgr_size, pkt->pts, vs->segment_start_pts);
     }
-
-    /* Atomically rename */
-    if (rename(temp_path, hls->frame_output_path) < 0) {
-        av_log(s, AV_LOG_WARNING, "Error renaming %s to %s: %s\n",
-               temp_path, hls->frame_output_path, strerror(errno));
-        unlink(temp_path);
-        return 0;
-    }
-
-    av_log(s, AV_LOG_DEBUG, "Frame written successfully to %s (segment: %s, offset: %.6f, size: %d, pkt_pts=%"PRId64", segment_start_pts=%"PRId64")\n",
-           hls->frame_output_path, segment_name, time_offset, bgr_size, pkt->pts, vs->segment_start_pts);
 
     /* Write metadata to separate file if enabled.
      * Open the metadata file lazily on first use and keep it open for the
@@ -2666,6 +2675,89 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
                         "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
                         segment_name, time_offset, frame->width, frame->height,
                         fps, bitrate, pts, is_keyframe);
+            }
+        }
+    }
+
+    /* Write to rolling buffer of numbered frame files if enabled.
+     * Works independently of hls_frame_output and uses the same BGR+metadata
+     * layout as the single-frame output. */
+    if (hls->frame_buffer_output && hls->frame_buffer_interval > 0 &&
+        (vs->frame_counter % hls->frame_buffer_interval == 0)) {
+        char   buf_path[MAX_URL_SIZE];
+        char   buf_tmp[MAX_URL_SIZE];
+        FILE  *buf_fp;
+        int    r;
+
+        hls->frame_buffer_index++;
+
+        /* Create target path for this frame */
+        r = snprintf(buf_path, sizeof(buf_path), hls->frame_buffer_output,
+                     (int)hls->frame_buffer_index);
+        if (r < 0 || r >= (int)sizeof(buf_path)) {
+            av_log(s, AV_LOG_WARNING,
+                   "Failed to format frame_buffer_output path for index %"PRId64"\n",
+                   hls->frame_buffer_index);
+            return 0;
+        }
+
+        /* Write via temporary file and rename for atomicity */
+        snprintf(buf_tmp, sizeof(buf_tmp), "%s.tmp", buf_path);
+
+        buf_fp = avpriv_fopen_utf8(buf_tmp, "wb");
+        if (!buf_fp) {
+            av_log(s, AV_LOG_WARNING, "Error opening buffer file %s: %s\n",
+                   buf_tmp, strerror(errno));
+            return 0;
+        }
+
+        if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
+            fprintf(buf_fp,
+                    "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
+                    segment_name, time_offset, program_date_time_str, now_time_str,
+                    frame->width, frame->height, fps, bitrate, pts, is_keyframe);
+        } else {
+            fprintf(buf_fp,
+                    "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
+                    segment_name, time_offset, frame->width, frame->height,
+                    fps, bitrate, pts, is_keyframe);
+        }
+
+        if (fwrite(vs->bgr_buffer, 1, bgr_size, buf_fp) != bgr_size) {
+            av_log(s, AV_LOG_WARNING, "Error writing BGR data to %s\n", buf_tmp);
+            fclose(buf_fp);
+            unlink(buf_tmp);
+            return 0;
+        }
+
+        fflush(buf_fp);
+        if (fclose(buf_fp) != 0) {
+            av_log(s, AV_LOG_WARNING, "Error closing buffer file %s\n", buf_tmp);
+            unlink(buf_tmp);
+            return 0;
+        }
+
+        if (rename(buf_tmp, buf_path) < 0) {
+            av_log(s, AV_LOG_WARNING, "Error renaming %s to %s: %s\n",
+                   buf_tmp, buf_path, strerror(errno));
+            unlink(buf_tmp);
+            return 0;
+        }
+
+        /* Maintain circular buffer: delete frames older than frame_buffer_size */
+        if (hls->frame_buffer_size > 0 &&
+            hls->frame_buffer_index > hls->frame_buffer_size) {
+            int64_t old_index = hls->frame_buffer_index - hls->frame_buffer_size;
+            char    old_path[MAX_URL_SIZE];
+
+            r = snprintf(old_path, sizeof(old_path), hls->frame_buffer_output,
+                         (int)old_index);
+            if (r >= 0 && r < (int)sizeof(old_path)) {
+                if (unlink(old_path) < 0 && errno != ENOENT) {
+                    av_log(s, AV_LOG_DEBUG,
+                           "Failed to delete old frame buffer file %s: %s\n",
+                           old_path, strerror(errno));
+                }
             }
         }
     }
@@ -2958,14 +3050,15 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
     if (pkt->pts == AV_NOPTS_VALUE)
         is_ref_pkt = can_split = 0;
 
-    /* Write frame if frame output is enabled - non-blocking, skips if decoder is busy */
-    /* Packets in hls_write_packet() come AFTER encoding, so they are already encoded.
+    /* Write frame for debug / external processing if enabled - non-blocking, skips if decoder is busy.
+     * Packets in hls_write_packet() come AFTER encoding, so they are already encoded.
      * We need to use the output stream codec for decoding, not the input stream codec.
      * IMPORTANT: We need to send ALL packets to the decoder, but only try to get frames
      * for every Nth packet. The decoder needs all packets to decode properly.
      * NOTE: This must be done AFTER checking for new segment start (vs->new_start) to ensure
      * segment_start_pts is set correctly. */
-    if (hls->frame_output_path && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && vs && oc) {
+    if ((hls->frame_output_path || hls->frame_buffer_output) &&
+        st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && vs && oc) {
         if (!vs->decoder_ctx) {
             /* Decoder not initialized yet - this should not happen, but log it */
             av_log(s, AV_LOG_DEBUG, "Decoder not initialized for stream %d\n", pkt->stream_index);
@@ -2978,11 +3071,17 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
                 av_log(s, AV_LOG_WARNING, "Error sending packet to decoder: %s\n", av_err2str(ret));
             }
             
-            /* Only try to get frame for every Nth packet */
-            if (vs->frame_counter % hls->frame_output_interval == 0) {
-                av_log(s, AV_LOG_DEBUG, "Trying to get frame %d (interval=%d)\n",
-                       vs->frame_counter, hls->frame_output_interval);
-                /* This function tries to receive a frame from decoder */
+            /* Only try to get frame for every Nth packet according to either
+             * single-frame output interval or buffer output interval. */
+            if ((hls->frame_output_path &&
+                 (vs->frame_counter % hls->frame_output_interval == 0)) ||
+                (hls->frame_buffer_output && hls->frame_buffer_interval > 0 &&
+                 (vs->frame_counter % hls->frame_buffer_interval == 0))) {
+                av_log(s, AV_LOG_DEBUG,
+                       "Trying to get frame %d (single_interval=%d, buffer_interval=%d)\n",
+                       vs->frame_counter, hls->frame_output_interval, hls->frame_buffer_interval);
+                /* This function tries to receive a frame from decoder and
+                 * will decide internally which outputs to write. */
                 write_frame_raw(s, hls, vs, pkt, st);
             }
         }
@@ -3285,6 +3384,7 @@ static void hls_deinit(AVFormatContext *s)
     av_freep(&hls->key_basename);
     av_freep(&hls->frame_output_path);
     av_freep(&hls->frame_meta_output_path);
+    av_freep(&hls->frame_buffer_output);
     av_freep(&hls->var_streams);
     av_freep(&hls->cc_streams);
     av_freep(&hls->master_m3u8_url);
@@ -3751,6 +3851,9 @@ static const AVOption options[] = {
     {"hls_frame_interval", "write every Nth frame (default: 1)", OFFSET(frame_output_interval), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, E},
     {"hls_frame_meta_output", "path to write frame metadata (append mode)", OFFSET(frame_meta_output_path), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     {"hls_frame_meta_interval", "write metadata every Nth frame (default: 1)", OFFSET(frame_meta_interval), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, E},
+    {"hls_frame_buffer_output", "template for numbered frame files (e.g. /path/frame_%09d.raw)", OFFSET(frame_buffer_output), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
+    {"hls_frame_buffer_interval", "write every Nth frame into frame buffer (default: 1)", OFFSET(frame_buffer_interval), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, E},
+    {"hls_frame_buffer_size", "how many last frames to keep in buffer (0 = unlimited)", OFFSET(frame_buffer_size), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, E},
     { NULL },
 };
 
