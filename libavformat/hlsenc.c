@@ -298,6 +298,11 @@ typedef struct HLSContext {
     int64_t frame_buffer_index;       /* global counter of frames written to buffer */
 } HLSContext;
 
+static av_always_inline int hls_has_frame_outputs(const HLSContext *hls)
+{
+    return hls->frame_output_path || hls->frame_buffer_output || hls->frame_meta_output_path;
+}
+
 static int strftime_expand(const char *fmt, char **dest)
 {
     int r = 1;
@@ -1954,7 +1959,7 @@ static int hls_start(AVFormatContext *s, VariantStream *vs)
     }
 
     /* Reset segment start PTS for frame output */
-    if (c->frame_output_path) {
+    if (hls_has_frame_outputs(c)) {
         av_log(s, AV_LOG_DEBUG, "hls_start() called, resetting segment_start_pts from %"PRId64" to AV_NOPTS_VALUE\n",
                vs->segment_start_pts);
         vs->segment_start_pts = AV_NOPTS_VALUE;
@@ -2578,6 +2583,7 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
     
     int64_t pts = pkt->pts;
     int     is_keyframe = (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
+    char    frame_type = av_get_picture_type_char(frame->pict_type);
 
     /* Write single latest frame if enabled (legacy hls_frame_output). */
     if (hls->frame_output_path) {
@@ -2596,9 +2602,9 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
          * name=...,offset=...,program_date_time=...,now=...,width=...,height=...,fps=...,bitrate=...,pts=...,is_keyframe=... */
         if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
             if (fprintf(fp,
-                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
+                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c\n",
                         segment_name, time_offset, program_date_time_str, now_time_str,
-                        frame->width, frame->height, fps, bitrate, pts, is_keyframe) < 0) {
+                        frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type) < 0) {
                 av_log(s, AV_LOG_WARNING, "Error writing metadata to %s\n", temp_path);
                 fclose(fp);
                 unlink(temp_path);
@@ -2607,9 +2613,9 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
         } else {
             /* Fallback: write legacy format without program_date_time/now */
             if (fprintf(fp,
-                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
+                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c\n",
                         segment_name, time_offset, frame->width, frame->height,
-                        fps, bitrate, pts, is_keyframe) < 0) {
+                        fps, bitrate, pts, is_keyframe, frame_type) < 0) {
                 av_log(s, AV_LOG_WARNING, "Error writing metadata to %s\n", temp_path);
                 fclose(fp);
                 unlink(temp_path);
@@ -2667,14 +2673,14 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
 
             if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
                 fprintf(meta_fp,
-                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
+                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c\n",
                         segment_name, time_offset, program_date_time_str, now_time_str,
-                        frame->width, frame->height, fps, bitrate, pts, is_keyframe);
+                        frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type);
             } else {
                 fprintf(meta_fp,
-                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
+                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c\n",
                         segment_name, time_offset, frame->width, frame->height,
-                        fps, bitrate, pts, is_keyframe);
+                        fps, bitrate, pts, is_keyframe, frame_type);
             }
         }
     }
@@ -2713,14 +2719,14 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
 
         if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
             fprintf(buf_fp,
-                    "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
+                    "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c\n",
                     segment_name, time_offset, program_date_time_str, now_time_str,
-                    frame->width, frame->height, fps, bitrate, pts, is_keyframe);
+                    frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type);
         } else {
             fprintf(buf_fp,
-                    "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d\n",
+                    "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c\n",
                     segment_name, time_offset, frame->width, frame->height,
-                    fps, bitrate, pts, is_keyframe);
+                    fps, bitrate, pts, is_keyframe, frame_type);
         }
 
         if (fwrite(vs->bgr_buffer, 1, bgr_size, buf_fp) != bgr_size) {
@@ -2813,7 +2819,8 @@ static int hls_write_header(AVFormatContext *s)
             /* IMPORTANT: Packets in hls_write_packet() come AFTER encoding, so we need to decode
              * the OUTPUT codec (H.264), not the input codec (HEVC). Use inner_st which is the
              * output stream codec parameters. */
-            if (hls->frame_output_path && outer_st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+            if (hls_has_frame_outputs(hls) &&
+                outer_st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
                 !vs->decoder_ctx && inner_st) {
                 const AVCodec *codec;
                 AVCodecContext *dec_ctx;
@@ -3023,7 +3030,8 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
             vs->start_pts_from_audio = 1;
         /* Initialize segment start PTS and PDT for frame output.
          * PDT is derived from accumulated segment durations, not wall clock. */
-        if (hls->frame_output_path && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        if (hls_has_frame_outputs(hls) &&
+            st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             vs->segment_start_pts   = pkt->pts;
             if (hls->flags & HLS_PROGRAM_DATE_TIME)
                 vs->current_segment_pdt = vs->initial_prog_date_time + vs->run_total_duration;
@@ -3035,7 +3043,7 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
         vs->start_pts = pkt->pts;
         vs->start_pts_from_audio = 0;
         /* Update segment start PTS and PDT for frame output */
-        if (hls->frame_output_path) {
+        if (hls_has_frame_outputs(hls)) {
             vs->segment_start_pts = pkt->pts;
             if (hls->flags & HLS_PROGRAM_DATE_TIME)
                 vs->current_segment_pdt = vs->initial_prog_date_time + vs->run_total_duration;
@@ -3050,39 +3058,38 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
     if (pkt->pts == AV_NOPTS_VALUE)
         is_ref_pkt = can_split = 0;
 
-    /* Write frame for debug / external processing if enabled - non-blocking, skips if decoder is busy.
-     * Packets in hls_write_packet() come AFTER encoding, so they are already encoded.
-     * We need to use the output stream codec for decoding, not the input stream codec.
-     * IMPORTANT: We need to send ALL packets to the decoder, but only try to get frames
-     * for every Nth packet. The decoder needs all packets to decode properly.
-     * NOTE: This must be done AFTER checking for new segment start (vs->new_start) to ensure
-     * segment_start_pts is set correctly. */
-    if ((hls->frame_output_path || hls->frame_buffer_output) &&
+    /* Determine whether this packet should produce a decoded frame for auxiliary outputs.
+     * We still send every packet to the decoder, but only attempt to drain a frame when
+     * the configured intervals request it. */
+    int need_frame_sample = 0;
+    if (hls_has_frame_outputs(hls) &&
         st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && vs && oc) {
         if (!vs->decoder_ctx) {
             /* Decoder not initialized yet - this should not happen, but log it */
             av_log(s, AV_LOG_DEBUG, "Decoder not initialized for stream %d\n", pkt->stream_index);
         } else {
             vs->frame_counter++;
-            
+
             /* Always send packets to decoder (it needs all of them) */
             int ret = avcodec_send_packet(vs->decoder_ctx, pkt);
             if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
                 av_log(s, AV_LOG_WARNING, "Error sending packet to decoder: %s\n", av_err2str(ret));
             }
-            
+
             /* Only try to get frame for every Nth packet according to either
-             * single-frame output interval or buffer output interval. */
-            if ((hls->frame_output_path &&
-                 (vs->frame_counter % hls->frame_output_interval == 0)) ||
-                (hls->frame_buffer_output && hls->frame_buffer_interval > 0 &&
-                 (vs->frame_counter % hls->frame_buffer_interval == 0))) {
+             * single-frame output interval, buffer output interval, or unconditionally
+             * if frame metadata logging is enabled. */
+            int sample_single = hls->frame_output_path &&
+                                (vs->frame_counter % hls->frame_output_interval == 0);
+            int sample_buffer = hls->frame_buffer_output && hls->frame_buffer_interval > 0 &&
+                                (vs->frame_counter % hls->frame_buffer_interval == 0);
+            int sample_meta = !!hls->frame_meta_output_path;
+
+            if (sample_single || sample_buffer || sample_meta) {
                 av_log(s, AV_LOG_DEBUG,
                        "Trying to get frame %d (single_interval=%d, buffer_interval=%d)\n",
                        vs->frame_counter, hls->frame_output_interval, hls->frame_buffer_interval);
-                /* This function tries to receive a frame from decoder and
-                 * will decide internally which outputs to write. */
-                write_frame_raw(s, hls, vs, pkt, st);
+                need_frame_sample = 1;
             }
         }
     }
@@ -3096,7 +3103,8 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
                                        * st->time_base.num / st->time_base.den;
             vs->dpp = (double)(pkt->duration) * st->time_base.num / st->time_base.den;
             /* Update segment start PTS and PDT for frame output when new segment starts */
-            if (hls->frame_output_path && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            if (hls_has_frame_outputs(hls) &&
+                st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
                 const char *seg_name = "unknown";
 
                 vs->segment_start_pts = pkt->pts;
@@ -3296,7 +3304,8 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
         /* Update segment start PTS and PDT for frame output AFTER hls_start().
          * hls_start() resets segment_start_pts to AV_NOPTS_VALUE and sets vs->new_start = 1.
          * We need to update it with the PTS of the packet that caused the split. */
-        if (hls->frame_output_path && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        if (hls_has_frame_outputs(hls) &&
+            st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             const char *new_seg_name = "unknown";
 
             vs->segment_start_pts = pkt->pts;
@@ -3321,6 +3330,10 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
         if (ret < 0) {
             return ret;
         }
+    }
+
+    if (need_frame_sample) {
+        write_frame_raw(s, hls, vs, pkt, st);
     }
 
     vs->packets_written++;
