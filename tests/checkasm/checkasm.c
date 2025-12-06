@@ -215,6 +215,9 @@ static const struct {
     #if CONFIG_ME_CMP
         { "motion", checkasm_check_motion },
     #endif
+    #if CONFIG_MPEGVIDEO
+        { "mpegvideo_unquantize", checkasm_check_mpegvideo_unquantize },
+    #endif
     #if CONFIG_MPEGVIDEOENCDSP
         { "mpegvideoencdsp", checkasm_check_mpegvideoencdsp },
     #endif
@@ -253,6 +256,9 @@ static const struct {
     #endif
     #if CONFIG_VP3DSP
         { "vp3dsp", checkasm_check_vp3dsp },
+    #endif
+    #if CONFIG_VP6_DECODER
+        { "vp6dsp", checkasm_check_vp6dsp },
     #endif
     #if CONFIG_VP8DSP
         { "vp8dsp", checkasm_check_vp8dsp },
@@ -324,6 +330,7 @@ static const struct {
     { "sw_range_convert", checkasm_check_sw_range_convert },
     { "sw_rgb", checkasm_check_sw_rgb },
     { "sw_scale", checkasm_check_sw_scale },
+    { "sw_xyz2rgb", checkasm_check_sw_xyz2rgb },
     { "sw_yuv2rgb", checkasm_check_sw_yuv2rgb },
     { "sw_yuv2yuv", checkasm_check_sw_yuv2yuv },
     { "sw_ops", checkasm_check_sw_ops },

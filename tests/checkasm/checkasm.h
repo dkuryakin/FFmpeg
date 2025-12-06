@@ -44,7 +44,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#if ARCH_X86_32
+#if defined(__i386__) || defined(_M_IX86)
 #include <setjmp.h>
 typedef jmp_buf checkasm_context;
 #define checkasm_save_context() checkasm_handle_signal(setjmp(checkasm_context_buf))
@@ -123,6 +123,7 @@ void checkasm_check_llviddsp(void);
 void checkasm_check_llviddspenc(void);
 void checkasm_check_lpc(void);
 void checkasm_check_motion(void);
+void checkasm_check_mpegvideo_unquantize(void);
 void checkasm_check_mpegvideoencdsp(void);
 void checkasm_check_nlmeans(void);
 void checkasm_check_opusdsp(void);
@@ -138,6 +139,7 @@ void checkasm_check_sw_gbrp(void);
 void checkasm_check_sw_range_convert(void);
 void checkasm_check_sw_rgb(void);
 void checkasm_check_sw_scale(void);
+void checkasm_check_sw_xyz2rgb(void);
 void checkasm_check_sw_yuv2rgb(void);
 void checkasm_check_sw_yuv2yuv(void);
 void checkasm_check_sw_ops(void);
@@ -154,6 +156,7 @@ void checkasm_check_vf_hflip(void);
 void checkasm_check_vf_threshold(void);
 void checkasm_check_vf_sobel(void);
 void checkasm_check_vp3dsp(void);
+void checkasm_check_vp6dsp(void);
 void checkasm_check_vp8dsp(void);
 void checkasm_check_vp9dsp(void);
 void checkasm_check_videodsp(void);

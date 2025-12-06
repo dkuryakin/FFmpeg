@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015 Manojkumar Bhosale (Manojkumar.Bhosale@imgtec.com)
+ * Copyright (c) 2025 Arpad Panyik <Arpad.Panyik@arm.com>
  *
  * This file is part of FFmpeg.
  *
@@ -18,16 +18,19 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavutil/attributes.h"
-#include "libavutil/mips/cpu.h"
-#include "libavcodec/mpegvideoenc.h"
-#include "mpegvideo_mips.h"
+#ifndef SWSCALE_AARCH64_ASM_OFFSETS_H
+#define SWSCALE_AARCH64_ASM_OFFSETS_H
 
-av_cold void ff_mpvenc_dct_init_mips(MPVEncContext *s)
-{
-    int cpu_flags = av_get_cpu_flags();
+/* SwsLuts */
+#define SL_IN  0x00
+#define SL_OUT 0x08
 
-    if (have_mmi(cpu_flags)) {
-        s->denoise_dct = ff_denoise_dct_mmi;
-    }
-}
+/* SwsColorXform */
+#define SCX_GAMMA     0x00
+#define SCX_MAT       0x10
+#define SCX_GAMMA_IN  (SCX_GAMMA + SL_IN)
+#define SCX_GAMMA_OUT (SCX_GAMMA + SL_OUT)
+#define SCX_MAT_00    SCX_MAT
+#define SCX_MAT_22    (SCX_MAT + 8 * 2)
+
+#endif /* SWSCALE_AARCH64_ASM_OFFSETS_H */
