@@ -2610,6 +2610,12 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
         }
     }
 
+    /* Source codec and encode/copy flag */
+    const FFStream *sti = ffstream(st);
+    enum AVCodecID src_codec_id = sti ? sti->orig_codec_id : st->codecpar->codec_id;
+    const char *src_codec_name = avcodec_get_name(src_codec_id);
+    int encoding_flag = (src_codec_id != st->codecpar->codec_id) ? 1 : 0;
+
     int64_t bitrate = 0;
     /* Try to get bitrate from various sources */
     if (dec_ctx->bit_rate > 0) {
@@ -2651,12 +2657,13 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
         }
 
         /* Write metadata as single line with key=value format:
-         * name=...,offset=...,program_date_time=...,now=...,width=...,height=...,fps=...,bitrate=...,pts=...,is_keyframe=...,driftN=... */
+         * name=...,offset=...,program_date_time=...,now=...,width=...,height=...,fps=...,bitrate=...,pts=...,is_keyframe=...,frame_type=...,codec=...,encoding=...,driftN=... */
         if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
             if (fprintf(fp,
-                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,%s\n",
+                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,%s\n",
                         segment_name, time_offset, program_date_time_str, now_time_str,
-                        frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type, drift_str) < 0) {
+                        frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type,
+                        src_codec_name, encoding_flag, drift_str) < 0) {
                 av_log(s, AV_LOG_WARNING, "Error writing metadata to %s\n", temp_path);
                 fclose(fp);
                 unlink(temp_path);
@@ -2665,9 +2672,10 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
         } else {
             /* Fallback: write legacy format without program_date_time/now */
             if (fprintf(fp,
-                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,%s\n",
+                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,%s\n",
                         segment_name, time_offset, frame->width, frame->height,
-                        fps, bitrate, pts, is_keyframe, frame_type, drift_str) < 0) {
+                        fps, bitrate, pts, is_keyframe, frame_type,
+                        src_codec_name, encoding_flag, drift_str) < 0) {
                 av_log(s, AV_LOG_WARNING, "Error writing metadata to %s\n", temp_path);
                 fclose(fp);
                 unlink(temp_path);
@@ -2725,14 +2733,16 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
 
             if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
                 fprintf(meta_fp,
-                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,%s\n",
+                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,%s\n",
                         segment_name, time_offset, program_date_time_str, now_time_str,
-                        frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type, drift_str);
+                        frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type,
+                        src_codec_name, encoding_flag, drift_str);
             } else {
                 fprintf(meta_fp,
-                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,%s\n",
+                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,%s\n",
                         segment_name, time_offset, frame->width, frame->height,
-                        fps, bitrate, pts, is_keyframe, frame_type, drift_str);
+                        fps, bitrate, pts, is_keyframe, frame_type,
+                        src_codec_name, encoding_flag, drift_str);
             }
         }
     }
@@ -2771,14 +2781,16 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
 
         if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
             fprintf(buf_fp,
-                    "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,%s\n",
+                    "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,%s\n",
                     segment_name, time_offset, program_date_time_str, now_time_str,
-                    frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type, drift_str);
+                    frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type,
+                    src_codec_name, encoding_flag, drift_str);
         } else {
             fprintf(buf_fp,
-                    "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,%s\n",
+                    "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,%s\n",
                     segment_name, time_offset, frame->width, frame->height,
-                    fps, bitrate, pts, is_keyframe, frame_type, drift_str);
+                    fps, bitrate, pts, is_keyframe, frame_type,
+                    src_codec_name, encoding_flag, drift_str);
         }
 
         if (fwrite(vs->bgr_buffer, 1, bgr_size, buf_fp) != bgr_size) {
