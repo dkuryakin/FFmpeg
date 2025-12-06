@@ -3319,7 +3319,21 @@ static int process_forced_keyframes(Muxer *mux, const OptionsContext *o)
                 forced_keyframes = auto_h264_kf_expr;
                 av_log(ost, AV_LOG_INFO,
                        "auto_h264: setting force_key_frames to align with hls_time=%.3f\n", hls_time);
+
+                /* Pass input codec info to HLS muxer for metadata output */
+                const char *input_codec = ost->ist && ost->ist->par ?
+                    avcodec_get_name(ost->ist->par->codec_id) : "unknown";
+                av_dict_set(&mux->opts, "hls_input_codec", input_codec, 0);
+                av_dict_set_int(&mux->opts, "hls_auto_h264_encode", 1, 0);
             }
+        }
+
+        /* For HLS with stream copy (not encoding), also pass codec info */
+        if (!ms->auto_h264_encode && ost->type == AVMEDIA_TYPE_VIDEO &&
+            !strcmp(mux->fc->oformat->name, "hls") && ost->ist && ost->ist->par) {
+            const char *input_codec = avcodec_get_name(ost->ist->par->codec_id);
+            av_dict_set(&mux->opts, "hls_input_codec", input_codec, AV_DICT_DONT_OVERWRITE);
+            av_dict_set_int(&mux->opts, "hls_auto_h264_encode", 0, AV_DICT_DONT_OVERWRITE);
         }
 
         if (!(ost->type == AVMEDIA_TYPE_VIDEO &&

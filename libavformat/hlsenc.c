@@ -237,6 +237,14 @@ typedef struct VariantStream {
         double  current_drift;      /* current averaged drift for this window */
     } drift_windows[MAX_DRIFT_WINDOWS];
     int     nb_drift_windows;       /* number of drift windows configured */
+
+    /* GOP tracking */
+    int     gop_counter;            /* frames counted in current GOP */
+    int     last_gop_size;          /* size of last completed GOP */
+
+    /* Input stream info for metadata */
+    char    input_codec_name[32];   /* codec name of input stream (e.g. "hevc", "h264") */
+    int     auto_h264_encode;       /* 1 if re-encoding via auto_h264, 0 if copy */
 } VariantStream;
 
 typedef struct ClosedCaptionsStream {
@@ -332,6 +340,10 @@ typedef struct HLSContext {
     char   *drift_window_str;         /* comma-separated list of drift window sizes */
     int     drift_window_sizes[MAX_DRIFT_WINDOWS]; /* parsed window sizes */
     int     nb_drift_windows;         /* number of drift windows */
+
+    /* Internal options for auto_h264 (set programmatically, not via CLI) */
+    char   *input_codec_name;         /* original input codec name (e.g. "hevc", "h264") */
+    int     auto_h264_encode;         /* 1 if re-encoding via auto_h264, 0 if stream copy */
 } HLSContext;
 
 static av_always_inline int hls_has_frame_outputs(const HLSContext *hls)
@@ -2594,6 +2606,9 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
         fps = av_q2d(st->avg_frame_rate);
     }
 
+    /* Keyframe flag - needed early for GOP tracking */
+    int is_keyframe = (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
+
     /* Build drift string with all window values */
     char drift_str[512] = "";
     {
@@ -2610,11 +2625,19 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
         }
     }
 
-    /* Source codec and encode/copy flag */
-    const FFStream *sti = ffstream(st);
-    enum AVCodecID src_codec_id = sti ? sti->orig_codec_id : st->codecpar->codec_id;
-    const char *src_codec_name = avcodec_get_name(src_codec_id);
-    int encoding_flag = (src_codec_id != st->codecpar->codec_id) ? 1 : 0;
+    /* GOP tracking: use last completed GOP size for metadata, update counters */
+    int gop_size_meta = vs->last_gop_size;
+    if (is_keyframe) {
+        if (vs->gop_counter > 0)
+            vs->last_gop_size = vs->gop_counter;
+        vs->gop_counter = 1; /* count this keyframe */
+    } else {
+        vs->gop_counter++;
+    }
+
+    /* Source codec and encode/copy flag - use stored values from input stream */
+    const char *src_codec_name = vs->input_codec_name[0] ? vs->input_codec_name : avcodec_get_name(st->codecpar->codec_id);
+    int encoding_flag = vs->auto_h264_encode;
 
     int64_t bitrate = 0;
     /* Try to get bitrate from various sources */
@@ -2640,7 +2663,6 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
     }
     
     int64_t pts = pkt->pts;
-    int     is_keyframe = (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
     char    frame_type = av_get_picture_type_char(frame->pict_type);
 
     /* Write single latest frame if enabled (legacy hls_frame_output). */
@@ -2657,13 +2679,13 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
         }
 
         /* Write metadata as single line with key=value format:
-         * name=...,offset=...,program_date_time=...,now=...,width=...,height=...,fps=...,bitrate=...,pts=...,is_keyframe=...,frame_type=...,codec=...,encoding=...,driftN=... */
+         * name=...,offset=...,program_date_time=...,now=...,width=...,height=...,fps=...,bitrate=...,pts=...,is_keyframe=...,frame_type=...,codec=...,encoding=...,gop_size=...,driftN=... */
         if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
             if (fprintf(fp,
-                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,%s\n",
+                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,gop_size=%d,%s\n",
                         segment_name, time_offset, program_date_time_str, now_time_str,
                         frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type,
-                        src_codec_name, encoding_flag, drift_str) < 0) {
+                        src_codec_name, encoding_flag, gop_size_meta, drift_str) < 0) {
                 av_log(s, AV_LOG_WARNING, "Error writing metadata to %s\n", temp_path);
                 fclose(fp);
                 unlink(temp_path);
@@ -2672,10 +2694,10 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
         } else {
             /* Fallback: write legacy format without program_date_time/now */
             if (fprintf(fp,
-                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,%s\n",
+                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,gop_size=%d,%s\n",
                         segment_name, time_offset, frame->width, frame->height,
                         fps, bitrate, pts, is_keyframe, frame_type,
-                        src_codec_name, encoding_flag, drift_str) < 0) {
+                        src_codec_name, encoding_flag, gop_size_meta, drift_str) < 0) {
                 av_log(s, AV_LOG_WARNING, "Error writing metadata to %s\n", temp_path);
                 fclose(fp);
                 unlink(temp_path);
@@ -2733,16 +2755,16 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
 
             if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
                 fprintf(meta_fp,
-                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,%s\n",
+                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,gop_size=%d,%s\n",
                         segment_name, time_offset, program_date_time_str, now_time_str,
                         frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type,
-                        src_codec_name, encoding_flag, drift_str);
+                        src_codec_name, encoding_flag, gop_size_meta, drift_str);
             } else {
                 fprintf(meta_fp,
-                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,%s\n",
+                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,gop_size=%d,%s\n",
                         segment_name, time_offset, frame->width, frame->height,
                         fps, bitrate, pts, is_keyframe, frame_type,
-                        src_codec_name, encoding_flag, drift_str);
+                        src_codec_name, encoding_flag, gop_size_meta, drift_str);
             }
         }
     }
@@ -2781,16 +2803,16 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
 
         if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
             fprintf(buf_fp,
-                    "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,%s\n",
+                    "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,gop_size=%d,%s\n",
                     segment_name, time_offset, program_date_time_str, now_time_str,
                     frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type,
-                    src_codec_name, encoding_flag, drift_str);
+                    src_codec_name, encoding_flag, gop_size_meta, drift_str);
         } else {
             fprintf(buf_fp,
-                    "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,%s\n",
+                    "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,codec=%s,encoding=%d,gop_size=%d,%s\n",
                     segment_name, time_offset, frame->width, frame->height,
                     fps, bitrate, pts, is_keyframe, frame_type,
-                    src_codec_name, encoding_flag, drift_str);
+                    src_codec_name, encoding_flag, gop_size_meta, drift_str);
         }
 
         if (fwrite(vs->bgr_buffer, 1, bgr_size, buf_fp) != bgr_size) {
@@ -2997,7 +3019,21 @@ static int hls_write_header(AVFormatContext *s)
                         av_log(s, AV_LOG_WARNING, "Could not allocate drift history buffer for window %d\n", wsize);
                     }
                 }
-                av_log(s, AV_LOG_INFO, "Decoder initialized successfully for frame output\n");
+
+                /* GOP tracking */
+                vs->gop_counter = 0;
+                vs->last_gop_size = 0;
+
+                /* Input codec info from auto_h264 */
+                if (hls->input_codec_name && hls->input_codec_name[0]) {
+                    av_strlcpy(vs->input_codec_name, hls->input_codec_name, sizeof(vs->input_codec_name));
+                } else {
+                    /* Fallback: use output codec name */
+                    av_strlcpy(vs->input_codec_name, avcodec_get_name(inner_st->codecpar->codec_id), sizeof(vs->input_codec_name));
+                }
+                vs->auto_h264_encode = hls->auto_h264_encode;
+                av_log(s, AV_LOG_INFO, "Decoder initialized successfully for frame output (input_codec=%s, encoding=%d)\n",
+                       vs->input_codec_name, vs->auto_h264_encode);
             }
         }
         /* Update the Codec Attr string for the mapped audio groups */
@@ -4127,6 +4163,9 @@ static const AVOption options[] = {
     {"hls_pts_discontinuity_threshold_pos", "threshold for forward PTS jump in seconds", OFFSET(pts_discontinuity_threshold_pos), AV_OPT_TYPE_DOUBLE, {.dbl = 1.0}, 0, DBL_MAX, E},
     {"hls_drift_startup_window", "number of frames for initial PTS-wallclock sync", OFFSET(drift_startup_window), AV_OPT_TYPE_INT, {.i64 = 30}, 1, INT_MAX, E},
     {"hls_drift_window", "comma-separated list of drift averaging window sizes (e.g. 1,30,300,900)", OFFSET(drift_window_str), AV_OPT_TYPE_STRING, {.str = "1,30,300,900"}, 0, 0, E},
+    /* Internal options for auto_h264 - set programmatically, not exposed in help */
+    {"hls_input_codec", "input codec name (internal, set by auto_h264)", OFFSET(input_codec_name), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
+    {"hls_auto_h264_encode", "encoding mode flag (internal, set by auto_h264)", OFFSET(auto_h264_encode), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, E},
     { NULL },
 };
 

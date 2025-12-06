@@ -131,18 +131,19 @@ When `hls_frame_meta_output` is specified, metadata is appended as text lines wi
 
 ```
 name=<segment>,offset=<time>,program_date_time=<iso>,now=<iso>,width=<w>,height=<h>,fps=<fps>,bitrate=<bps>,
-pts=<pts>,is_keyframe=<0|1>,frame_type=<I|P|B>,codec=<src_codec>,encoding=<1|0>,drift1=<d>,drift30=<d>,...
+pts=<pts>,is_keyframe=<0|1>,frame_type=<I|P|B>,codec=<src_codec>,encoding=<1|0>,gop_size=<n>,drift1=<d>,drift30=<d>,...
 ```
 
 Fields:
 - `codec` — исходный кодек потока (например hevc, h264), **не auto_h264**
 - `encoding` — 1 если идёт перекодирование (source codec != output codec), 0 если stream copy
+- `gop_size` — размер предыдущего завершённого GOP (количество кадров между ключевыми)
 
 Example:
 ```
 name=segment_00001.ts,offset=1.234567,program_date_time=2024-01-15T12:34:56.789Z,now=2024-01-15T12:34:56.791Z,
 width=1920,height=1080,fps=25.000,bitrate=4000000,pts=123456,is_keyframe=1,frame_type=I,
-codec=hevc,encoding=1,drift1=0.001234,drift30=0.002345,drift300=0.003456,drift900=0.004567
+codec=hevc,encoding=1,gop_size=24,drift1=0.001234,drift30=0.002345,drift300=0.003456,drift900=0.004567
 ```
 
 ### Usage Example
