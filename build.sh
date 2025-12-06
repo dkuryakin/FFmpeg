@@ -31,7 +31,7 @@ PATH=$TARGET_DIR/bin:$PATH ./configure \
     --disable-debug \
     --disable-doc \
     --disable-programs \
-    --enable-ffprobe \
+    --disable-ffprobe \
     --enable-ffmpeg
 
 PATH=$TARGET_DIR/bin:$PATH make -j$(nproc)

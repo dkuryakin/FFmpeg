@@ -1,0 +1,92 @@
+name: Build and Release FFmpeg
+
+on:
+  push:
+    tags:
+      - 'release-*'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf \
+            automake \
+            build-essential \
+            cmake \
+            git \
+            libtool \
+            pkg-config \
+            yasm \
+            nasm \
+            libx264-dev \
+            libx265-dev \
+            libnuma-dev \
+            zlib1g-dev
+
+      - name: Configure FFmpeg
+        run: |
+          TARGET_DIR=${{ github.workspace }}/ffmpeg_build
+          ./configure \
+            --prefix="$TARGET_DIR" \
+            --pkg-config-flags="--static" \
+            --extra-cflags="-I$TARGET_DIR/include" \
+            --extra-ldflags="-L$TARGET_DIR/lib" \
+            --extra-libs="-lpthread -lm" \
+            --bindir="$TARGET_DIR/bin" \
+            --ld="g++" \
+            --enable-gpl \
+            --enable-libx264 \
+            --enable-libx265 \
+            --disable-ffplay \
+            --disable-debug \
+            --disable-doc \
+            --disable-programs \
+            --disable-ffprobe \
+            --enable-ffmpeg
+
+      - name: Build FFmpeg
+        run: |
+          make -j$(nproc)
+          make install
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/release-}" >> $GITHUB_OUTPUT
+
+      - name: Create release archive
+        run: |
+          cd ffmpeg_build/bin
+          tar -czvf ffmpeg-${{ steps.version.outputs.VERSION }}-linux-x86_64.tar.gz ffmpeg
+          mv ffmpeg-${{ steps.version.outputs.VERSION }}-linux-x86_64.tar.gz ${{ github.workspace }}/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: FFmpeg ${{ steps.version.outputs.VERSION }}
+          body: |
+            ## FFmpeg Custom Build ${{ steps.version.outputs.VERSION }}
+            
+            Custom FFmpeg build with HLS extensions:
+            - `auto_h264` codec for automatic H.264 passthrough/encoding
+            - Frame extraction (`hls_frame_output`, `hls_frame_buffer_output`)
+            - Frame metadata logging (`hls_frame_meta_output`)
+            - PTS discontinuity detection
+            - Multi-window drift monitoring
+            - TCP as default RTSP transport
+            
+            See [HLS.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/HLS.md) for full documentation.
+          files: |
+            ffmpeg-${{ steps.version.outputs.VERSION }}-linux-x86_64.tar.gz
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
