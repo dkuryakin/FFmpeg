@@ -3956,9 +3956,9 @@ static int hls_init(AVFormatContext *s)
 #define E AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
     {"start_number",  "set first number in the sequence",        OFFSET(start_sequence),AV_OPT_TYPE_INT64,  {.i64 = 0},     0, INT64_MAX, E},
-    {"hls_time",      "set segment length",                      OFFSET(time),          AV_OPT_TYPE_DURATION, {.i64 = 2000000}, 0, INT64_MAX, E},
+    {"hls_time",      "set segment length",                      OFFSET(time),          AV_OPT_TYPE_DURATION, {.i64 = 1000000}, 0, INT64_MAX, E},
     {"hls_init_time", "set segment length at init list",         OFFSET(init_time),     AV_OPT_TYPE_DURATION, {.i64 = 0},       0, INT64_MAX, E},
-    {"hls_list_size", "set maximum number of playlist entries",  OFFSET(max_nb_segments),    AV_OPT_TYPE_INT,    {.i64 = 5},     0, INT_MAX, E},
+    {"hls_list_size", "set maximum number of playlist entries",  OFFSET(max_nb_segments),    AV_OPT_TYPE_INT,    {.i64 = 0},     0, INT_MAX, E},
     {"hls_delete_threshold", "set number of unreferenced segments to keep before deleting",  OFFSET(hls_delete_threshold),    AV_OPT_TYPE_INT,    {.i64 = 1},     1, INT_MAX, E},
     {"hls_vtt_options","set hls vtt list of options for the container format used for hls", OFFSET(vtt_format_options_str), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,    E},
     {"hls_allow_cache", "explicitly set whether the client MAY (1) or MUST NOT (0) cache media segments", OFFSET(allowcache), AV_OPT_TYPE_INT, {.i64 = -1}, INT_MIN, INT_MAX, E},
@@ -3977,7 +3977,7 @@ static const AVOption options[] = {
     {"fmp4",   "make segment file to fragment mp4 files in m3u8", 0, AV_OPT_TYPE_CONST, {.i64 = SEGMENT_TYPE_FMP4 }, 0, UINT_MAX,   E, .unit = "segment_type"},
     {"hls_fmp4_init_filename", "set fragment mp4 file init filename", OFFSET(fmp4_init_filename),   AV_OPT_TYPE_STRING, {.str = "init.mp4"},            0,       0,         E},
     {"hls_fmp4_init_resend", "resend fragment mp4 init file after refresh m3u8 every time", OFFSET(resend_init_file), AV_OPT_TYPE_BOOL, {.i64 = 0 }, 0, 1, E },
-    {"hls_flags",     "set flags affecting HLS playlist and media file generation", OFFSET(flags), AV_OPT_TYPE_FLAGS, {.i64 = 0 }, 0, UINT_MAX, E, .unit = "flags"},
+    {"hls_flags",     "set flags affecting HLS playlist and media file generation", OFFSET(flags), AV_OPT_TYPE_FLAGS, {.i64 = HLS_APPEND_LIST | HLS_OMIT_ENDLIST | HLS_PROGRAM_DATE_TIME }, 0, UINT_MAX, E, .unit = "flags"},
     {"single_file",   "generate a single media file indexed with byte ranges", 0, AV_OPT_TYPE_CONST, {.i64 = HLS_SINGLE_FILE }, 0, UINT_MAX,   E, .unit = "flags"},
     {"temp_file", "write segment and playlist to temporary file and rename when complete", 0, AV_OPT_TYPE_CONST, {.i64 = HLS_TEMP_FILE }, 0, UINT_MAX,   E, .unit = "flags"},
     {"delete_segments", "delete segment files that are no longer part of the playlist", 0, AV_OPT_TYPE_CONST, {.i64 = HLS_DELETE_SEGMENTS }, 0, UINT_MAX,   E, .unit = "flags"},
@@ -4020,11 +4020,11 @@ static const AVOption options[] = {
     {"hls_frame_buffer_output", "template for numbered frame files (e.g. /path/frame_%09d.raw)", OFFSET(frame_buffer_output), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     {"hls_frame_buffer_interval", "write every Nth frame into frame buffer (default: 1)", OFFSET(frame_buffer_interval), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, E},
     {"hls_frame_buffer_size", "how many last frames to keep in buffer (0 = unlimited)", OFFSET(frame_buffer_size), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, E},
-    {"hls_pts_discontinuity_exit", "exit process on PTS discontinuity", OFFSET(pts_discontinuity_exit), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, E},
-    {"hls_pts_discontinuity_threshold_neg", "threshold for backward PTS jump in seconds (default: 0)", OFFSET(pts_discontinuity_threshold_neg), AV_OPT_TYPE_DOUBLE, {.dbl = 0}, 0, DBL_MAX, E},
-    {"hls_pts_discontinuity_threshold_pos", "threshold for forward PTS jump in seconds (default: 1)", OFFSET(pts_discontinuity_threshold_pos), AV_OPT_TYPE_DOUBLE, {.dbl = 1}, 0, DBL_MAX, E},
-    {"hls_drift_startup_window", "number of frames for initial PTS-wallclock sync (default: 1)", OFFSET(drift_startup_window), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, E},
-    {"hls_drift_window", "number of frames for drift averaging (default: 1)", OFFSET(drift_window), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, E},
+    {"hls_pts_discontinuity_exit", "exit process on PTS discontinuity", OFFSET(pts_discontinuity_exit), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, E},
+    {"hls_pts_discontinuity_threshold_neg", "threshold for backward PTS jump in seconds", OFFSET(pts_discontinuity_threshold_neg), AV_OPT_TYPE_DOUBLE, {.dbl = 0.1}, 0, DBL_MAX, E},
+    {"hls_pts_discontinuity_threshold_pos", "threshold for forward PTS jump in seconds", OFFSET(pts_discontinuity_threshold_pos), AV_OPT_TYPE_DOUBLE, {.dbl = 1.0}, 0, DBL_MAX, E},
+    {"hls_drift_startup_window", "number of frames for initial PTS-wallclock sync", OFFSET(drift_startup_window), AV_OPT_TYPE_INT, {.i64 = 10}, 1, INT_MAX, E},
+    {"hls_drift_window", "number of frames for drift averaging", OFFSET(drift_window), AV_OPT_TYPE_INT, {.i64 = 30}, 1, INT_MAX, E},
     { NULL },
 };
 

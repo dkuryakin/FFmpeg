@@ -90,6 +90,9 @@ typedef struct MuxStream {
     int             force_fps;
 
     const char     *apad;
+
+    /* Flag indicating auto_h264 mode triggered encoding (for applying default x264 options) */
+    int             auto_h264_encode;
 } MuxStream;
 
 typedef struct Muxer {

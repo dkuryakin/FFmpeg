@@ -90,6 +90,32 @@ static int choose_encoder(const OptionsContext *o, AVFormatContext *s,
         return 0;
     }
 
+    /* Handle auto_h264: if input is h264, use stream copy; otherwise encode with libx264 */
+    if (codec_name && !strcmp(codec_name, "auto_h264")) {
+        if (type != AVMEDIA_TYPE_VIDEO) {
+            av_log(ost, AV_LOG_FATAL,
+                   "'auto_h264' codec can only be used for video streams\n");
+            return AVERROR(EINVAL);
+        }
+        if (ost->ist && ost->ist->par &&
+            ost->ist->par->codec_id == AV_CODEC_ID_H264) {
+            /* Input is H.264, use stream copy */
+            av_log(ost, AV_LOG_INFO,
+                   "auto_h264: input is H.264, using stream copy\n");
+            /* enc stays NULL, which means copy */
+            return 0;
+        } else {
+            /* Input is not H.264, encode with libx264 */
+            const char *input_codec_name = ost->ist && ost->ist->par ?
+                avcodec_get_name(ost->ist->par->codec_id) : "unknown";
+            av_log(ost, AV_LOG_INFO,
+                   "auto_h264: input is %s (not H.264), will encode with libx264\n",
+                   input_codec_name);
+            codec_name = "libx264";
+            ms->auto_h264_encode = 1;  /* Flag to apply default x264 options */
+        }
+    }
+
     if (!codec_name) {
         ms->par_in->codec_id = av_guess_codec(s->oformat, NULL, s->url, NULL, ost->type);
         *enc = avcodec_find_encoder(ms->par_in->codec_id);
@@ -642,6 +668,15 @@ static int new_stream_video(Muxer *mux, const OptionsContext *o,
                 return AVERROR(EINVAL);
         }
 
+        /* Apply auto_h264 video defaults (only if not overridden by user) */
+        if (ms->auto_h264_encode) {
+            /* Set pix_fmt to yuv420p if not already specified */
+            if (!frame_pix_fmt && video_enc->pix_fmt == AV_PIX_FMT_NONE)
+                video_enc->pix_fmt = AV_PIX_FMT_YUV420P;
+            /* Set global_header flag for HLS compatibility */
+            video_enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        }
+
         opt_match_per_stream_str(ost, &o->intra_matrices, oc, st, &intra_matrix);
         if (intra_matrix) {
             if (!(video_enc->intra_matrix = av_mallocz(sizeof(*video_enc->intra_matrix) * 64)))
@@ -773,6 +808,11 @@ static int new_stream_video(Muxer *mux, const OptionsContext *o,
             ret = parse_and_set_vsync(fps_mode, vsync_method, ost->file->index, ost->index, 0);
             if (ret < 0)
                 return ret;
+        }
+
+        /* auto_h264: default to passthrough fps_mode if not specified by user */
+        if (ms->auto_h264_encode && !fps_mode) {
+            *vsync_method = VSYNC_PASSTHROUGH;
         }
 
         if ((ms->frame_rate.num || ms->max_frame_rate.num) &&
@@ -1314,6 +1354,15 @@ static int ost_add(Muxer *mux, const OptionsContext *o, enum AVMediaType type,
                                 &mux->enc_opts_used);
         if (ret < 0)
             goto fail;
+
+        /* Apply default x264 options for auto_h264 mode (user options can override) */
+        if (ms->auto_h264_encode) {
+            av_log(ost, AV_LOG_INFO, "auto_h264: applying default libx264 options\n");
+            /* These use AV_DICT_DONT_OVERWRITE so user can override via command line */
+            av_dict_set(&encoder_opts, "preset", "veryfast", AV_DICT_DONT_OVERWRITE);
+            av_dict_set(&encoder_opts, "tune", "zerolatency", AV_DICT_DONT_OVERWRITE);
+            av_dict_set(&encoder_opts, "x264-params", "scenecut=0", AV_DICT_DONT_OVERWRITE);
+        }
 
         opt_match_per_stream_str(ost, &o->presets, oc, st, &preset);
         opt_match_per_stream_int(ost, &o->autoscale, oc, st, &autoscale);
@@ -3247,10 +3296,31 @@ static int process_forced_keyframes(Muxer *mux, const OptionsContext *o)
 {
     for (int i = 0; i < mux->of.nb_streams; i++) {
         OutputStream *ost = mux->of.streams[i];
+        MuxStream *ms = ms_from_ost(ost);
         const char *forced_keyframes = NULL;
+        char auto_h264_kf_expr[128] = {0};
 
         opt_match_per_stream_str(ost, &o->forced_key_frames,
                                  mux->fc, ost->st, &forced_keyframes);
+
+        /* auto_h264: auto-set force_key_frames for HLS if not specified by user */
+        if (!forced_keyframes && ms->auto_h264_encode &&
+            ost->type == AVMEDIA_TYPE_VIDEO && ost->enc) {
+            /* Check if output format is HLS */
+            if (!strcmp(mux->fc->oformat->name, "hls")) {
+                /* Get hls_time from format options (default 1 second) */
+                AVDictionaryEntry *e = av_dict_get(mux->opts, "hls_time", NULL, 0);
+                double hls_time = e ? atof(e->value) : 1.0;
+                /* Convert to seconds if it was in microseconds (duration format) */
+                if (hls_time > 1000000)
+                    hls_time /= 1000000.0;
+                snprintf(auto_h264_kf_expr, sizeof(auto_h264_kf_expr),
+                         "expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+%.3f))", hls_time);
+                forced_keyframes = auto_h264_kf_expr;
+                av_log(ost, AV_LOG_INFO,
+                       "auto_h264: setting force_key_frames to align with hls_time=%.3f\n", hls_time);
+            }
+        }
 
         if (!(ost->type == AVMEDIA_TYPE_VIDEO &&
               ost->enc && forced_keyframes))
