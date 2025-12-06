@@ -89,8 +89,8 @@ Optimized defaults for RTSP-to-HLS live streaming.
 | `hls_pts_discontinuity_exit` | 0 | **1** | Exit on stream issues |
 | `hls_pts_discontinuity_threshold_neg` | 0 | **0.1** | 100ms backward jump threshold |
 | `hls_pts_discontinuity_threshold_pos` | 1 | **1.0** | 1 sec forward jump threshold |
-| `hls_drift_startup_window` | 1 | **10** | 10 frames for sync |
-| `hls_drift_window` | 1 | **30** | 30 frames averaging |
+| `hls_drift_startup_window` | 1 | **30** | 30 frames for baseline selection |
+| `hls_drift_window` | "1" | **"1,30,300,900"** | Multiple averaging windows |
 
 ### Default hls_flags Explained
 
@@ -127,16 +127,15 @@ Frames are written as raw BGR24 data:
 
 ### Frame Metadata Format
 
-When `hls_frame_meta_output` is specified, metadata is appended as text lines:
+When `hls_frame_meta_output` is specified, metadata is appended as text lines with key=value format:
 
 ```
-<segment_name> <time_offset_in_segment> <width> <height> <drift>
+name=<segment>,offset=<time>,program_date_time=<iso>,now=<iso>,width=<w>,height=<h>,fps=<fps>,bitrate=<bps>,pts=<pts>,is_keyframe=<0|1>,frame_type=<I|P|B>,drift1=<d>,drift30=<d>,...
 ```
 
 Example:
 ```
-segment_00001.ts 1.234567 1920 1080 0.003
-segment_00001.ts 1.267890 1920 1080 0.002
+name=segment_00001.ts,offset=1.234567,program_date_time=2024-01-15T12:34:56.789Z,now=2024-01-15T12:34:56.791Z,width=1920,height=1080,fps=25.000,bitrate=4000000,pts=123456,is_keyframe=1,frame_type=I,drift1=0.001234,drift30=0.002345,drift300=0.003456,drift900=0.004567
 ```
 
 ### Usage Example
@@ -200,21 +199,49 @@ Calculates drift between PTS timestamps and wall-clock time for stream health mo
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `hls_drift_startup_window` | int | **10** | Number of frames for initial PTS-wallclock sync |
-| `hls_drift_window` | int | **30** | Number of frames for drift averaging |
+| `hls_drift_startup_window` | int | **30** | Number of frames for baseline selection |
+| `hls_drift_window` | string | **"1,30,300,900"** | Comma-separated list of averaging window sizes |
 
 ### How Drift Works
 
-1. **Startup phase:** First N frames establish baseline PTS-to-wallclock mapping
+1. **Startup phase:** First N frames are analyzed to find the best baseline:
+   - First frame is used as temporary baseline (drift = 0)
+   - For each subsequent frame, drift relative to first frame is calculated
+   - The frame with **minimum drift** (closest to real-time, even if negative) becomes the final baseline
+   - This selects the frame that arrived with least network/processing lag
 2. **Running phase:** Drift is calculated as difference between expected and actual timestamps
-3. **Averaging:** Moving average over `drift_window` frames smooths out jitter
+3. **Multiple windows:** Drift is calculated with sliding sum for each window size (O(1) per frame)
+
+### Multiple Drift Windows
+
+The `hls_drift_window` option accepts a comma-separated list of window sizes:
+- **Short windows (1-30):** Detect sudden changes quickly
+- **Medium windows (300):** ~10-12 seconds of averaging at 25fps
+- **Long windows (900):** ~30+ seconds for long-term trend detection
+
+Each window uses efficient sliding sum calculation, suitable for large window sizes.
 
 ### Drift Value in Metadata
 
-When using `hls_frame_meta_output`, drift is included in each line:
-- **Positive drift:** Stream is behind real-time
-- **Negative drift:** Stream is ahead of real-time
+When using `hls_frame_meta_output`, drift values for all windows are included:
+
+```
+...,drift1=0.001234,drift30=0.002345,drift300=0.003456,drift900=0.004567
+```
+
+- **Positive drift:** Stream is behind real-time (frames arriving late)
+- **Negative drift:** Stream is ahead of real-time (frames arriving early)
 - **Near zero:** Stream is synchronized
+
+### Custom Windows Example
+
+```bash
+# Use only short-term drift detection
+ffmpeg ... -hls_drift_window "1,10,30" ...
+
+# Use longer windows for stable connections
+ffmpeg ... -hls_drift_window "30,60,300,900,1800" ...
+```
 
 ---
 
@@ -262,8 +289,8 @@ ffmpeg \
     -hls_pts_discontinuity_exit 1 \
     -hls_pts_discontinuity_threshold_neg 0.1 \
     -hls_pts_discontinuity_threshold_pos 1.0 \
-    -hls_drift_startup_window 10 \
-    -hls_drift_window 30 \
+    -hls_drift_startup_window 30 \
+    -hls_drift_window "1,30,300,900" \
     playlist.m3u8
 ```
 
@@ -284,5 +311,5 @@ ffmpeg \
 | **Monitoring** | `hls_pts_discontinuity_exit` | **1** | Exit on stream issues |
 | **Monitoring** | `hls_pts_discontinuity_threshold_neg` | **0.1** | Backward jump threshold |
 | **Monitoring** | `hls_pts_discontinuity_threshold_pos` | **1.0** | Forward jump threshold |
-| **Monitoring** | `hls_drift_startup_window` | **10** | Initial sync frames |
-| **Monitoring** | `hls_drift_window` | **30** | Averaging frames |
+| **Monitoring** | `hls_drift_startup_window` | **30** | Baseline selection frames |
+| **Monitoring** | `hls_drift_window` | **"1,30,300,900"** | Multiple averaging windows |

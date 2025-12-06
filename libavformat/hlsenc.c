@@ -216,16 +216,27 @@ typedef struct VariantStream {
     int64_t prev_video_pts;           /* previous video PTS for discontinuity detection */
     int     prev_video_pts_valid;     /* flag indicating prev_video_pts is valid */
     int     drift_startup_count;      /* frames received during startup phase */
-    double  drift_startup_wallclock_sum; /* sum of wallclock times during startup */
-    double  drift_startup_pts_sec_sum;   /* sum of PTS values (in seconds) during startup */
-    double  drift_baseline_wallclock; /* baseline wallclock time (after startup) */
-    double  drift_baseline_pts_sec;   /* baseline PTS in seconds (after startup) */
+    double  drift_first_wallclock;    /* wallclock of first frame (temporary baseline) */
+    double  drift_first_pts_sec;      /* PTS of first frame in seconds */
+    double  drift_best_wallclock;     /* wallclock of best baseline candidate */
+    double  drift_best_pts_sec;       /* PTS of best baseline candidate */
+    double  drift_min_value;          /* minimum drift value seen during startup */
+    double  drift_baseline_wallclock; /* final baseline wallclock time */
+    double  drift_baseline_pts_sec;   /* final baseline PTS in seconds */
     int     drift_baseline_valid;     /* flag indicating baseline is established */
-    double *drift_history;            /* circular buffer of drift values */
-    int     drift_history_index;      /* current index in circular buffer */
-    int     drift_history_count;      /* number of valid entries in drift_history */
     AVRational drift_time_base;       /* time base for PTS->seconds conversion */
-    double  current_drift;            /* current averaged drift value */
+
+    /* Multiple drift windows with sliding sum calculation */
+#define MAX_DRIFT_WINDOWS 16
+    struct {
+        int     window_size;        /* size of this window */
+        double *history;            /* circular buffer of drift values */
+        int     history_index;      /* current index in circular buffer */
+        int     history_count;      /* number of valid entries */
+        double  sum;                /* running sum for O(1) updates */
+        double  current_drift;      /* current averaged drift for this window */
+    } drift_windows[MAX_DRIFT_WINDOWS];
+    int     nb_drift_windows;       /* number of drift windows configured */
 } VariantStream;
 
 typedef struct ClosedCaptionsStream {
@@ -317,8 +328,10 @@ typedef struct HLSContext {
     int     pts_discontinuity_exit;   /* if set, exit on PTS discontinuity */
     double  pts_discontinuity_threshold_neg; /* threshold for backward PTS jump (default: 0) */
     double  pts_discontinuity_threshold_pos; /* threshold for forward PTS jump (default: 1) */
-    int     drift_startup_window;     /* number of frames for initial PTS-wallclock sync (default: 1) */
-    int     drift_window;             /* number of frames for drift averaging (default: 1) */
+    int     drift_startup_window;     /* number of frames for initial PTS-wallclock sync (default: 10) */
+    char   *drift_window_str;         /* comma-separated list of drift window sizes */
+    int     drift_window_sizes[MAX_DRIFT_WINDOWS]; /* parsed window sizes */
+    int     nb_drift_windows;         /* number of drift windows */
 } HLSContext;
 
 static av_always_inline int hls_has_frame_outputs(const HLSContext *hls)
@@ -2581,8 +2594,21 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
         fps = av_q2d(st->avg_frame_rate);
     }
 
-    /* Get current drift value */
-    double drift = vs->current_drift;
+    /* Build drift string with all window values */
+    char drift_str[512] = "";
+    {
+        int pos = 0;
+        for (int w = 0; w < vs->nb_drift_windows && pos < (int)sizeof(drift_str) - 50; w++) {
+            int wsize = vs->drift_windows[w].window_size;
+            double drift_val = vs->drift_windows[w].current_drift;
+            if (w > 0)
+                pos += snprintf(drift_str + pos, sizeof(drift_str) - pos, ",");
+            pos += snprintf(drift_str + pos, sizeof(drift_str) - pos, "drift%d=%.6f", wsize, drift_val);
+        }
+        if (vs->nb_drift_windows == 0) {
+            snprintf(drift_str, sizeof(drift_str), "drift=0.000000");
+        }
+    }
 
     int64_t bitrate = 0;
     /* Try to get bitrate from various sources */
@@ -2625,12 +2651,12 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
         }
 
         /* Write metadata as single line with key=value format:
-         * name=...,offset=...,program_date_time=...,now=...,width=...,height=...,fps=...,bitrate=...,pts=...,is_keyframe=...,drift=... */
+         * name=...,offset=...,program_date_time=...,now=...,width=...,height=...,fps=...,bitrate=...,pts=...,is_keyframe=...,driftN=... */
         if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
             if (fprintf(fp,
-                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,drift=%.6f\n",
+                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,%s\n",
                         segment_name, time_offset, program_date_time_str, now_time_str,
-                        frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type, drift) < 0) {
+                        frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type, drift_str) < 0) {
                 av_log(s, AV_LOG_WARNING, "Error writing metadata to %s\n", temp_path);
                 fclose(fp);
                 unlink(temp_path);
@@ -2639,9 +2665,9 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
         } else {
             /* Fallback: write legacy format without program_date_time/now */
             if (fprintf(fp,
-                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,drift=%.6f\n",
+                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,%s\n",
                         segment_name, time_offset, frame->width, frame->height,
-                        fps, bitrate, pts, is_keyframe, frame_type, drift) < 0) {
+                        fps, bitrate, pts, is_keyframe, frame_type, drift_str) < 0) {
                 av_log(s, AV_LOG_WARNING, "Error writing metadata to %s\n", temp_path);
                 fclose(fp);
                 unlink(temp_path);
@@ -2699,14 +2725,14 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
 
             if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
                 fprintf(meta_fp,
-                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,drift=%.6f\n",
+                        "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,%s\n",
                         segment_name, time_offset, program_date_time_str, now_time_str,
-                        frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type, drift);
+                        frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type, drift_str);
             } else {
                 fprintf(meta_fp,
-                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,drift=%.6f\n",
+                        "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,%s\n",
                         segment_name, time_offset, frame->width, frame->height,
-                        fps, bitrate, pts, is_keyframe, frame_type, drift);
+                        fps, bitrate, pts, is_keyframe, frame_type, drift_str);
             }
         }
     }
@@ -2745,14 +2771,14 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
 
         if ((hls->flags & HLS_PROGRAM_DATE_TIME) && program_date_time_str[0] && now_time_str[0]) {
             fprintf(buf_fp,
-                    "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,drift=%.6f\n",
+                    "name=%s,offset=%.6f,program_date_time=%s,now=%s,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,%s\n",
                     segment_name, time_offset, program_date_time_str, now_time_str,
-                    frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type, drift);
+                    frame->width, frame->height, fps, bitrate, pts, is_keyframe, frame_type, drift_str);
         } else {
             fprintf(buf_fp,
-                    "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,drift=%.6f\n",
+                    "name=%s,offset=%.6f,width=%d,height=%d,fps=%.3f,bitrate=%"PRId64",pts=%"PRId64",is_keyframe=%d,frame_type=%c,%s\n",
                     segment_name, time_offset, frame->width, frame->height,
-                    fps, bitrate, pts, is_keyframe, frame_type, drift);
+                    fps, bitrate, pts, is_keyframe, frame_type, drift_str);
         }
 
         if (fwrite(vs->bgr_buffer, 1, bgr_size, buf_fp) != bgr_size) {
@@ -2935,19 +2961,28 @@ static int hls_write_header(AVFormatContext *s)
                 vs->prev_video_pts = AV_NOPTS_VALUE;
                 vs->prev_video_pts_valid = 0;
                 vs->drift_startup_count = 0;
-                vs->drift_startup_wallclock_sum = 0.0;
-                vs->drift_startup_pts_sec_sum = 0.0;
+                vs->drift_first_wallclock = 0.0;
+                vs->drift_first_pts_sec = 0.0;
+                vs->drift_best_wallclock = 0.0;
+                vs->drift_best_pts_sec = 0.0;
+                vs->drift_min_value = 0.0;
                 vs->drift_baseline_wallclock = 0.0;
                 vs->drift_baseline_pts_sec = 0.0;
                 vs->drift_baseline_valid = 0;
                 vs->drift_time_base = inner_st->time_base;
-                vs->current_drift = 0.0;
-                vs->drift_history_index = 0;
-                vs->drift_history_count = 0;
-                if (hls->drift_window > 0) {
-                    vs->drift_history = av_mallocz(sizeof(double) * hls->drift_window);
-                    if (!vs->drift_history) {
-                        av_log(s, AV_LOG_WARNING, "Could not allocate drift history buffer\n");
+
+                /* Initialize multiple drift windows */
+                vs->nb_drift_windows = hls->nb_drift_windows;
+                for (int w = 0; w < hls->nb_drift_windows; w++) {
+                    int wsize = hls->drift_window_sizes[w];
+                    vs->drift_windows[w].window_size = wsize;
+                    vs->drift_windows[w].history_index = 0;
+                    vs->drift_windows[w].history_count = 0;
+                    vs->drift_windows[w].sum = 0.0;
+                    vs->drift_windows[w].current_drift = 0.0;
+                    vs->drift_windows[w].history = av_mallocz(sizeof(double) * wsize);
+                    if (!vs->drift_windows[w].history) {
+                        av_log(s, AV_LOG_WARNING, "Could not allocate drift history buffer for window %d\n", wsize);
                     }
                 }
                 av_log(s, AV_LOG_INFO, "Decoder initialized successfully for frame output\n");
@@ -3028,7 +3063,7 @@ static int check_pts_discontinuity_and_update_drift(AVFormatContext *s, HLSConte
     double wallclock_now;
     double pts_sec;
     double expected_wallclock;
-    double current_drift;
+    double instant_drift;
     int i;
 
     if (pkt->pts == AV_NOPTS_VALUE)
@@ -3062,19 +3097,36 @@ static int check_pts_discontinuity_and_update_drift(AVFormatContext *s, HLSConte
     if (!hls_has_frame_outputs(hls))
         return 0;
 
-    /* Phase 1: Startup - collecting baseline data */
+    /* Phase 1: Startup - find best baseline frame (minimum drift relative to first frame) */
     if (vs->drift_startup_count < hls->drift_startup_window) {
-        vs->drift_startup_wallclock_sum += wallclock_now;
-        vs->drift_startup_pts_sec_sum += pts_sec;
+        if (vs->drift_startup_count == 0) {
+            /* First frame: temporary baseline, drift = 0 by definition */
+            vs->drift_first_wallclock = wallclock_now;
+            vs->drift_first_pts_sec = pts_sec;
+            vs->drift_best_wallclock = wallclock_now;
+            vs->drift_best_pts_sec = pts_sec;
+            vs->drift_min_value = 0.0;
+        } else {
+            /* Calculate drift relative to first frame */
+            double expected = vs->drift_first_wallclock + (pts_sec - vs->drift_first_pts_sec);
+            double drift = wallclock_now - expected;
+
+            /* If this frame has lower drift (arrived earlier than expected), use it as baseline */
+            if (drift < vs->drift_min_value) {
+                vs->drift_min_value = drift;
+                vs->drift_best_wallclock = wallclock_now;
+                vs->drift_best_pts_sec = pts_sec;
+            }
+        }
         vs->drift_startup_count++;
 
         if (vs->drift_startup_count == hls->drift_startup_window) {
-            /* Baseline established: average of startup window */
-            vs->drift_baseline_wallclock = vs->drift_startup_wallclock_sum / hls->drift_startup_window;
-            vs->drift_baseline_pts_sec = vs->drift_startup_pts_sec_sum / hls->drift_startup_window;
+            /* Use the best frame (minimum drift) as final baseline */
+            vs->drift_baseline_wallclock = vs->drift_best_wallclock;
+            vs->drift_baseline_pts_sec = vs->drift_best_pts_sec;
             vs->drift_baseline_valid = 1;
-            av_log(s, AV_LOG_DEBUG, "Drift baseline established: wallclock=%.6f, pts_sec=%.6f\n",
-                   vs->drift_baseline_wallclock, vs->drift_baseline_pts_sec);
+            av_log(s, AV_LOG_INFO, "Drift baseline established: frame with min_drift=%.6f selected, wallclock=%.6f, pts_sec=%.6f\n",
+                   vs->drift_min_value, vs->drift_baseline_wallclock, vs->drift_baseline_pts_sec);
         }
         return 0;
     }
@@ -3089,27 +3141,37 @@ static int check_pts_discontinuity_and_update_drift(AVFormatContext *s, HLSConte
     /* Drift = actual wallclock - expected wallclock
      * Positive drift = frames arriving late (stream running slow)
      * Negative drift = frames arriving early (stream running fast) */
-    current_drift = wallclock_now - expected_wallclock;
+    instant_drift = wallclock_now - expected_wallclock;
 
-    /* Update drift history (circular buffer) */
-    if (vs->drift_history && hls->drift_window > 0) {
-        vs->drift_history[vs->drift_history_index] = current_drift;
-        vs->drift_history_index = (vs->drift_history_index + 1) % hls->drift_window;
-        if (vs->drift_history_count < hls->drift_window)
-            vs->drift_history_count++;
+    /* Update all drift windows using sliding sum (O(1) per window) */
+    for (i = 0; i < vs->nb_drift_windows; i++) {
+        int window_size = vs->drift_windows[i].window_size;
+        double *history = vs->drift_windows[i].history;
+        int idx = vs->drift_windows[i].history_index;
+        int count = vs->drift_windows[i].history_count;
 
-        /* Calculate averaged drift over the window */
-        double drift_sum = 0.0;
-        for (i = 0; i < vs->drift_history_count; i++) {
-            drift_sum += vs->drift_history[i];
+        if (!history)
+            continue;
+
+        /* If buffer is full, subtract the old value being overwritten */
+        if (count == window_size) {
+            vs->drift_windows[i].sum -= history[idx];
         }
-        vs->current_drift = drift_sum / vs->drift_history_count;
-    } else {
-        vs->current_drift = current_drift;
+
+        /* Add new value */
+        history[idx] = instant_drift;
+        vs->drift_windows[i].sum += instant_drift;
+
+        /* Update index and count */
+        vs->drift_windows[i].history_index = (idx + 1) % window_size;
+        if (count < window_size)
+            vs->drift_windows[i].history_count = count + 1;
+
+        /* Calculate averaged drift */
+        vs->drift_windows[i].current_drift = vs->drift_windows[i].sum / vs->drift_windows[i].history_count;
     }
 
-    av_log(s, AV_LOG_DEBUG, "Drift: current=%.6f, averaged=%.6f (window=%d/%d)\n",
-           current_drift, vs->current_drift, vs->drift_history_count, hls->drift_window);
+    av_log(s, AV_LOG_DEBUG, "Drift: instant=%.6f, windows=%d\n", instant_drift, vs->nb_drift_windows);
 
     return 0;
 }
@@ -3536,7 +3598,12 @@ static void hls_deinit(AVFormatContext *s)
         av_freep(&vs->bgr_buffer);
         av_frame_free(&vs->decoded_frame);
         avcodec_free_context(&vs->decoder_ctx);
-        av_freep(&vs->drift_history);
+
+        /* Free drift window buffers */
+        for (int w = 0; w < vs->nb_drift_windows; w++) {
+            av_freep(&vs->drift_windows[w].history);
+        }
+        vs->nb_drift_windows = 0;
     }
 
     ff_format_io_close(s, &hls->m3u8_out);
@@ -3729,6 +3796,29 @@ static int hls_init(AVFormatContext *s)
 
     if (!hls->method && http_base_proto) {
         av_log(hls, AV_LOG_WARNING, "No HTTP method set, hls muxer defaulting to method PUT.\n");
+    }
+
+    /* Parse drift window sizes from comma-separated string */
+    hls->nb_drift_windows = 0;
+    if (hls->drift_window_str && hls->drift_window_str[0]) {
+        char *str = av_strdup(hls->drift_window_str);
+        char *token, *saveptr;
+        if (str) {
+            token = av_strtok(str, ",", &saveptr);
+            while (token && hls->nb_drift_windows < MAX_DRIFT_WINDOWS) {
+                int wsize = atoi(token);
+                if (wsize > 0) {
+                    hls->drift_window_sizes[hls->nb_drift_windows++] = wsize;
+                    av_log(s, AV_LOG_INFO, "Drift window %d: size=%d frames\n",
+                           hls->nb_drift_windows, wsize);
+                }
+                token = av_strtok(NULL, ",", &saveptr);
+            }
+            av_free(str);
+        }
+    }
+    if (hls->nb_drift_windows == 0) {
+        av_log(s, AV_LOG_INFO, "No drift windows configured\n");
     }
 
     ret = validate_name(hls->nb_varstreams, s->url);
@@ -4023,8 +4113,8 @@ static const AVOption options[] = {
     {"hls_pts_discontinuity_exit", "exit process on PTS discontinuity", OFFSET(pts_discontinuity_exit), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, E},
     {"hls_pts_discontinuity_threshold_neg", "threshold for backward PTS jump in seconds", OFFSET(pts_discontinuity_threshold_neg), AV_OPT_TYPE_DOUBLE, {.dbl = 0.1}, 0, DBL_MAX, E},
     {"hls_pts_discontinuity_threshold_pos", "threshold for forward PTS jump in seconds", OFFSET(pts_discontinuity_threshold_pos), AV_OPT_TYPE_DOUBLE, {.dbl = 1.0}, 0, DBL_MAX, E},
-    {"hls_drift_startup_window", "number of frames for initial PTS-wallclock sync", OFFSET(drift_startup_window), AV_OPT_TYPE_INT, {.i64 = 10}, 1, INT_MAX, E},
-    {"hls_drift_window", "number of frames for drift averaging", OFFSET(drift_window), AV_OPT_TYPE_INT, {.i64 = 30}, 1, INT_MAX, E},
+    {"hls_drift_startup_window", "number of frames for initial PTS-wallclock sync", OFFSET(drift_startup_window), AV_OPT_TYPE_INT, {.i64 = 30}, 1, INT_MAX, E},
+    {"hls_drift_window", "comma-separated list of drift averaging window sizes (e.g. 1,30,300,900)", OFFSET(drift_window_str), AV_OPT_TYPE_STRING, {.str = "1,30,300,900"}, 0, 0, E},
     { NULL },
 };
 
