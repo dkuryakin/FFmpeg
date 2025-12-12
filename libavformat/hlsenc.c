@@ -341,6 +341,20 @@ typedef struct HLSContext {
     int     drift_window_sizes[MAX_DRIFT_WINDOWS]; /* parsed window sizes */
     int     nb_drift_windows;         /* number of drift windows */
 
+    /* Drift threshold options: format "window_size:threshold,..." */
+    char   *drift_min_threshold_str;  /* min drift thresholds, e.g. "300:-2,900:-5" */
+    char   *drift_max_threshold_str;  /* max drift thresholds, e.g. "30:2,300:5" */
+    struct {
+        int window_size;
+        double threshold;
+    } drift_min_thresholds[MAX_DRIFT_WINDOWS];
+    int     nb_drift_min_thresholds;
+    struct {
+        int window_size;
+        double threshold;
+    } drift_max_thresholds[MAX_DRIFT_WINDOWS];
+    int     nb_drift_max_thresholds;
+
     /* Internal options for auto_h264 (set programmatically, not via CLI) */
     char   *input_codec_name;         /* original input codec name (e.g. "hevc", "h264") */
     int     auto_h264_encode;         /* 1 if re-encoding via auto_h264, 0 if stream copy */
@@ -3221,6 +3235,39 @@ static int check_pts_discontinuity_and_update_drift(AVFormatContext *s, HLSConte
 
     av_log(s, AV_LOG_DEBUG, "Drift: instant=%.6f, windows=%d\n", instant_drift, vs->nb_drift_windows);
 
+    /* Check drift thresholds */
+    for (i = 0; i < vs->nb_drift_windows; i++) {
+        int window_size = vs->drift_windows[i].window_size;
+        double current_drift = vs->drift_windows[i].current_drift;
+        int j;
+
+        /* Check min thresholds (drift < threshold triggers exit) */
+        for (j = 0; j < hls->nb_drift_min_thresholds; j++) {
+            if (hls->drift_min_thresholds[j].window_size == window_size) {
+                double threshold = hls->drift_min_thresholds[j].threshold;
+                if (current_drift < threshold) {
+                    av_log(s, AV_LOG_ERROR, "Drift threshold exceeded: drift%d=%.6f < %.6f (min threshold), exiting\n",
+                           window_size, current_drift, threshold);
+                    exit(1);
+                }
+                break;
+            }
+        }
+
+        /* Check max thresholds (drift > threshold triggers exit) */
+        for (j = 0; j < hls->nb_drift_max_thresholds; j++) {
+            if (hls->drift_max_thresholds[j].window_size == window_size) {
+                double threshold = hls->drift_max_thresholds[j].threshold;
+                if (current_drift > threshold) {
+                    av_log(s, AV_LOG_ERROR, "Drift threshold exceeded: drift%d=%.6f > %.6f (max threshold), exiting\n",
+                           window_size, current_drift, threshold);
+                    exit(1);
+                }
+                break;
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -3869,6 +3916,56 @@ static int hls_init(AVFormatContext *s)
         av_log(s, AV_LOG_INFO, "No drift windows configured\n");
     }
 
+    /* Parse min drift thresholds from "window_size:threshold,..." string */
+    hls->nb_drift_min_thresholds = 0;
+    if (hls->drift_min_threshold_str && hls->drift_min_threshold_str[0]) {
+        char *str = av_strdup(hls->drift_min_threshold_str);
+        char *token, *saveptr;
+        if (str) {
+            token = av_strtok(str, ",", &saveptr);
+            while (token && hls->nb_drift_min_thresholds < MAX_DRIFT_WINDOWS) {
+                int wsize;
+                double threshold;
+                if (sscanf(token, "%d:%lf", &wsize, &threshold) == 2 && wsize > 0) {
+                    hls->drift_min_thresholds[hls->nb_drift_min_thresholds].window_size = wsize;
+                    hls->drift_min_thresholds[hls->nb_drift_min_thresholds].threshold = threshold;
+                    av_log(s, AV_LOG_INFO, "Drift min threshold: window=%d, threshold=%.6f sec\n",
+                           wsize, threshold);
+                    hls->nb_drift_min_thresholds++;
+                } else {
+                    av_log(s, AV_LOG_WARNING, "Invalid drift min threshold format: %s (expected window:threshold)\n", token);
+                }
+                token = av_strtok(NULL, ",", &saveptr);
+            }
+            av_free(str);
+        }
+    }
+
+    /* Parse max drift thresholds from "window_size:threshold,..." string */
+    hls->nb_drift_max_thresholds = 0;
+    if (hls->drift_max_threshold_str && hls->drift_max_threshold_str[0]) {
+        char *str = av_strdup(hls->drift_max_threshold_str);
+        char *token, *saveptr;
+        if (str) {
+            token = av_strtok(str, ",", &saveptr);
+            while (token && hls->nb_drift_max_thresholds < MAX_DRIFT_WINDOWS) {
+                int wsize;
+                double threshold;
+                if (sscanf(token, "%d:%lf", &wsize, &threshold) == 2 && wsize > 0) {
+                    hls->drift_max_thresholds[hls->nb_drift_max_thresholds].window_size = wsize;
+                    hls->drift_max_thresholds[hls->nb_drift_max_thresholds].threshold = threshold;
+                    av_log(s, AV_LOG_INFO, "Drift max threshold: window=%d, threshold=%.6f sec\n",
+                           wsize, threshold);
+                    hls->nb_drift_max_thresholds++;
+                } else {
+                    av_log(s, AV_LOG_WARNING, "Invalid drift max threshold format: %s (expected window:threshold)\n", token);
+                }
+                token = av_strtok(NULL, ",", &saveptr);
+            }
+            av_free(str);
+        }
+    }
+
     ret = validate_name(hls->nb_varstreams, s->url);
     if (ret < 0)
         return ret;
@@ -4163,6 +4260,8 @@ static const AVOption options[] = {
     {"hls_pts_discontinuity_threshold_pos", "threshold for forward PTS jump in seconds", OFFSET(pts_discontinuity_threshold_pos), AV_OPT_TYPE_DOUBLE, {.dbl = 1.0}, 0, DBL_MAX, E},
     {"hls_drift_startup_window", "number of frames for initial PTS-wallclock sync", OFFSET(drift_startup_window), AV_OPT_TYPE_INT, {.i64 = 30}, 1, INT_MAX, E},
     {"hls_drift_window", "comma-separated list of drift averaging window sizes (e.g. 1,30,300,900)", OFFSET(drift_window_str), AV_OPT_TYPE_STRING, {.str = "1,30,300,900"}, 0, 0, E},
+    {"hls_drift_min_threshold", "min drift thresholds per window (e.g. 300:-2,900:-5)", OFFSET(drift_min_threshold_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
+    {"hls_drift_max_threshold", "max drift thresholds per window (e.g. 30:2,300:5)", OFFSET(drift_max_threshold_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     /* Internal options for auto_h264 - set programmatically, not exposed in help */
     {"hls_input_codec", "input codec name (internal, set by auto_h264)", OFFSET(input_codec_name), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     {"hls_auto_h264_encode", "encoding mode flag (internal, set by auto_h264)", OFFSET(auto_h264_encode), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, E},

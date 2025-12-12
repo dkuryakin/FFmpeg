@@ -209,6 +209,8 @@ Calculates drift between PTS timestamps and wall-clock time for stream health mo
 |--------|------|---------|-------------|
 | `hls_drift_startup_window` | int | **30** | Number of frames for baseline selection |
 | `hls_drift_window` | string | **"1,30,300,900"** | Comma-separated list of averaging window sizes |
+| `hls_drift_min_threshold` | string | NULL | Min drift thresholds per window (e.g. `"300:-2,900:-5"`) |
+| `hls_drift_max_threshold` | string | NULL | Max drift thresholds per window (e.g. `"30:2,300:5"`) |
 
 ### How Drift Works
 
@@ -240,6 +242,28 @@ When using `hls_frame_meta_output`, drift values for all windows are included:
 - **Positive drift:** Stream is behind real-time (frames arriving late)
 - **Negative drift:** Stream is ahead of real-time (frames arriving early)
 - **Near zero:** Stream is synchronized
+
+### Drift Threshold Exit
+
+The `hls_drift_min_threshold` and `hls_drift_max_threshold` options allow setting exit thresholds per drift window. When a threshold is exceeded, FFmpeg exits with code 1.
+
+**Format:** `"window_size:threshold,window_size:threshold,..."`
+
+- **Min threshold:** Exit if drift < threshold (stream running too fast)
+- **Max threshold:** Exit if drift > threshold (stream running too slow)
+
+```bash
+# Exit if drift300 < -2 sec (stream running 2+ seconds ahead)
+ffmpeg ... -hls_drift_min_threshold "300:-2" ...
+
+# Exit if drift30 > 2 sec (stream running 2+ seconds behind)
+ffmpeg ... -hls_drift_max_threshold "30:2" ...
+
+# Multiple thresholds for different windows
+ffmpeg ... \
+    -hls_drift_min_threshold "300:-2,900:-5" \
+    -hls_drift_max_threshold "30:2,300:5" ...
+```
 
 ### Custom Windows Example
 
@@ -299,6 +323,8 @@ ffmpeg \
     -hls_pts_discontinuity_threshold_pos 1.0 \
     -hls_drift_startup_window 30 \
     -hls_drift_window "1,30,300,900" \
+    -hls_drift_min_threshold "300:-2,900:-5" \
+    -hls_drift_max_threshold "30:2,300:5" \
     playlist.m3u8
 ```
 
@@ -321,3 +347,5 @@ ffmpeg \
 | **Monitoring** | `hls_pts_discontinuity_threshold_pos` | **1.0** | Forward jump threshold |
 | **Monitoring** | `hls_drift_startup_window` | **30** | Baseline selection frames |
 | **Monitoring** | `hls_drift_window` | **"1,30,300,900"** | Multiple averaging windows |
+| **Monitoring** | `hls_drift_min_threshold` | NULL | Min drift thresholds per window |
+| **Monitoring** | `hls_drift_max_threshold` | NULL | Max drift thresholds per window |
