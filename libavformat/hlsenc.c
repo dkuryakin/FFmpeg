@@ -363,10 +363,6 @@ typedef struct HLSContext {
 
     /* Graceful exit flag - when set, current segment is finished before exiting */
     int     graceful_exit_requested;  /* 1 if graceful exit is pending */
-
-    /* Events log */
-    char   *events_log_path;          /* path to events log file (append mode) */
-    FILE   *events_log_fp;            /* file handle for events log */
 } HLSContext;
 
 static av_always_inline int hls_has_frame_outputs(const HLSContext *hls)
@@ -375,42 +371,50 @@ static av_always_inline int hls_has_frame_outputs(const HLSContext *hls)
 }
 
 /**
- * Write an event to the events log file.
+ * Write an event to FFMPEG_EVENTS_LOG file (if set via environment variable).
  * Format: JSON lines with ISO8601 timestamp.
  * 
- * @param hls HLS context
+ * @param hls HLS context (unused, kept for API compatibility)
  * @param event Event name (e.g., "SEGMENT_START")
  * @param fmt printf-style format for additional JSON fields (without leading comma)
  *            Pass NULL if no additional fields needed.
  */
 static void hls_log_event(HLSContext *hls, const char *event, const char *fmt, ...)
 {
+    const char *log_path = getenv("FFMPEG_EVENTS_LOG");
     struct timeval tv;
     struct tm tm_info;
     char ts_buf[64];
-    
-    if (!hls->events_log_fp)
+    FILE *fp;
+
+    (void)hls; /* unused */
+
+    if (!log_path || !log_path[0])
         return;
-    
+
+    fp = fopen(log_path, "a");
+    if (!fp)
+        return;
+
     gettimeofday(&tv, NULL);
     localtime_r(&tv.tv_sec, &tm_info);
     snprintf(ts_buf, sizeof(ts_buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03d",
              tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
              tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
              (int)(tv.tv_usec / 1000));
-    
-    fprintf(hls->events_log_fp, "{\"ts\":\"%s\",\"event\":\"%s\"", ts_buf, event);
-    
+
+    fprintf(fp, "{\"ts\":\"%s\",\"event\":\"%s\"", ts_buf, event);
+
     if (fmt && fmt[0]) {
         va_list args;
         va_start(args, fmt);
-        fprintf(hls->events_log_fp, ",");
-        vfprintf(hls->events_log_fp, fmt, args);
+        fprintf(fp, ",");
+        vfprintf(fp, fmt, args);
         va_end(args);
     }
-    
-    fprintf(hls->events_log_fp, "}\n");
-    fflush(hls->events_log_fp);
+
+    fprintf(fp, "}\n");
+    fclose(fp);
 }
 
 static int strftime_expand(const char *fmt, char **dest)
@@ -3802,11 +3806,7 @@ static void hls_deinit(AVFormatContext *s)
         fclose(hls->frame_meta_fp);
         hls->frame_meta_fp = NULL;
     }
-    if (hls->events_log_fp) {
-        fflush(hls->events_log_fp);
-        fclose(hls->events_log_fp);
-        hls->events_log_fp = NULL;
-    }
+    hls_log_event(hls, "DEINIT_COMPLETE", NULL);
     av_freep(&hls->key_basename);
     av_freep(&hls->frame_output_path);
     av_freep(&hls->frame_meta_output_path);
@@ -3974,17 +3974,8 @@ static int hls_init(AVFormatContext *s)
     int fmp4_init_filename_len = strlen(hls->fmp4_init_filename) + 1;
     double initial_program_date_time = av_gettime() / 1000000.0;
 
-    /* Open events log file if configured */
-    if (hls->events_log_path) {
-        hls->events_log_fp = fopen(hls->events_log_path, "a");
-        if (!hls->events_log_fp) {
-            av_log(s, AV_LOG_WARNING, "Failed to open events log file '%s': %s\n",
-                   hls->events_log_path, strerror(errno));
-        } else {
-            hls_log_event(hls, "INIT_START", "\"output\":\"%s\",\"nb_streams\":%d",
-                          s->url, s->nb_streams);
-        }
-    }
+    hls_log_event(hls, "INIT_START", "\"output\":\"%s\",\"nb_streams\":%d",
+                  s->url, s->nb_streams);
 
     if (hls->use_localtime) {
         pattern = get_default_pattern_localtime_fmt(s);
@@ -4378,7 +4369,6 @@ static const AVOption options[] = {
     {"hls_drift_window", "comma-separated list of drift averaging window sizes (e.g. 1,30,300,900)", OFFSET(drift_window_str), AV_OPT_TYPE_STRING, {.str = "1,30,300,900"}, 0, 0, E},
     {"hls_drift_min_threshold", "min drift thresholds per window (e.g. 300:-2,900:-5)", OFFSET(drift_min_threshold_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     {"hls_drift_max_threshold", "max drift thresholds per window (e.g. 30:2,300:5)", OFFSET(drift_max_threshold_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
-    {"hls_events_log", "path to events log file (append mode, JSON lines format)", OFFSET(events_log_path), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     /* Internal options for auto_h264 - set programmatically, not exposed in help */
     {"hls_input_codec", "input codec name (internal, set by auto_h264)", OFFSET(input_codec_name), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     {"hls_auto_h264_encode", "encoding mode flag (internal, set by auto_h264)", OFFSET(auto_h264_encode), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, E},

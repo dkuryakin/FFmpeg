@@ -21,6 +21,9 @@
 
 #include "config_components.h"
 
+#include <stdarg.h>
+#include <sys/time.h>
+
 #include "libavutil/avassert.h"
 #include "libavutil/base64.h"
 #include "libavutil/bprint.h"
@@ -62,6 +65,45 @@
 #define READ_PACKET_TIMEOUT_S 10
 #define RECVBUF_SIZE 10 * RTP_MAX_PACKET_LENGTH
 #define DEFAULT_REORDERING_DELAY 100000
+
+/**
+ * Log an event to FFMPEG_EVENTS_LOG file (if set via environment variable).
+ */
+static void rtsp_log_event(const char *event, const char *fmt, ...)
+{
+    const char *log_path = getenv("FFMPEG_EVENTS_LOG");
+    struct timeval tv;
+    struct tm tm_info;
+    char ts_buf[64];
+    FILE *fp;
+
+    if (!log_path || !log_path[0])
+        return;
+
+    fp = fopen(log_path, "a");
+    if (!fp)
+        return;
+
+    gettimeofday(&tv, NULL);
+    localtime_r(&tv.tv_sec, &tm_info);
+    snprintf(ts_buf, sizeof(ts_buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03d",
+             tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
+             tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
+             (int)(tv.tv_usec / 1000));
+
+    fprintf(fp, "{\"ts\":\"%s\",\"event\":\"%s\"", ts_buf, event);
+
+    if (fmt && fmt[0]) {
+        va_list args;
+        va_start(args, fmt);
+        fprintf(fp, ",");
+        vfprintf(fp, fmt, args);
+        va_end(args);
+    }
+
+    fprintf(fp, "}\n");
+    fclose(fp);
+}
 
 #define OFFSET(x) offsetof(RTSPState, x)
 #define DEC AV_OPT_FLAG_DECODING_PARAM
@@ -1965,12 +2007,15 @@ redirect:
         ff_url_join(tcpname, sizeof(tcpname), lower_rtsp_proto, NULL,
                     host, port,
                     "?timeout=%"PRId64, rt->stimeout);
+        rtsp_log_event("RTSP_CONNECT_START", "\"host\":\"%s\",\"port\":%d", host, port);
         if ((ret = ffurl_open_whitelist(&rt->rtsp_hd, tcpname, AVIO_FLAG_READ_WRITE,
                        &s->interrupt_callback, &proto_opts, s->protocol_whitelist, s->protocol_blacklist, NULL)) < 0) {
+            rtsp_log_event("RTSP_CONNECT_FAILED", "\"host\":\"%s\",\"port\":%d,\"error\":%d", host, port, ret);
             av_dict_free(&proto_opts);
             err = ret;
             goto fail;
         }
+        rtsp_log_event("RTSP_CONNECT_SUCCESS", "\"host\":\"%s\",\"port\":%d", host, port);
         av_dict_free(&proto_opts);
         rt->rtsp_hd_out = rt->rtsp_hd;
     }

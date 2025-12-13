@@ -337,17 +337,37 @@ ffmpeg ... -hls_drift_window "30,60,300,900,1800" ...
 
 ## 6. Events Log
 
-**Location:** `libavformat/hlsenc.c`
+**Location:** `fftools/ffmpeg.c`, `libavformat/rtsp.c`, `libavformat/hlsenc.c`
 
-Append-only log file for tracking key control events during HLS encoding.
+Append-only log file for tracking key control events during FFmpeg execution. Enabled via environment variable.
 
-### Options
+### Environment Variable
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `hls_events_log` | string | NULL | Path to events log file (append mode, JSON lines format) |
+| Variable | Description |
+|----------|-------------|
+| `FFMPEG_EVENTS_LOG` | Path to events log file (append mode, JSON lines format) |
 
 ### Events
+
+#### Process-level events (ffmpeg.c)
+
+| Event | Description | Fields |
+|-------|-------------|--------|
+| `PROCESS_START` | FFmpeg process started | pid |
+| `PARSE_OPTIONS_START` | Options parsing begins | - |
+| `PARSE_OPTIONS_COMPLETE` | Options parsed, inputs/outputs opened | ret, nb_inputs, nb_outputs |
+| `TRANSCODE_START` | Transcoding begins | - |
+| `PROCESS_END` | FFmpeg process ending | ret |
+
+#### RTSP events (rtsp.c)
+
+| Event | Description | Fields |
+|-------|-------------|--------|
+| `RTSP_CONNECT_START` | Starting RTSP connection | host, port |
+| `RTSP_CONNECT_SUCCESS` | RTSP connection established | host, port |
+| `RTSP_CONNECT_FAILED` | RTSP connection failed | host, port, error |
+
+#### HLS muxer events (hlsenc.c)
 
 | Event | Description | Fields |
 |-------|-------------|--------|
@@ -365,30 +385,54 @@ Append-only log file for tracking key control events during HLS encoding.
 | `IO_ERROR` | I/O error occurred | op, file, error |
 | `SHUTDOWN_START` | Shutdown begins | graceful_exit |
 | `SHUTDOWN_COMPLETE` | Shutdown finished | - |
+| `DEINIT_COMPLETE` | HLS muxer cleanup finished | - |
 
 ### Log Format (JSON Lines)
 
 Each line is a valid JSON object with ISO8601 timestamp:
 
 ```json
-{"ts":"2025-12-13T12:34:56.789","event":"INIT_START","output":"output.m3u8","nb_streams":2}
-{"ts":"2025-12-13T12:34:56.790","event":"INIT_COMPLETE","nb_varstreams":1}
-{"ts":"2025-12-13T12:34:57.100","event":"FIRST_PACKET","pts":0,"type":"video"}
-{"ts":"2025-12-13T12:34:57.100","event":"SEGMENT_START","seq":0,"file":"segment0.ts"}
+{"ts":"2025-12-13T12:34:56.100","event":"PROCESS_START","pid":12345}
+{"ts":"2025-12-13T12:34:56.150","event":"PARSE_OPTIONS_START"}
+{"ts":"2025-12-13T12:34:56.200","event":"RTSP_CONNECT_START","host":"192.168.1.100","port":554}
+{"ts":"2025-12-13T12:34:56.500","event":"RTSP_CONNECT_SUCCESS","host":"192.168.1.100","port":554}
+{"ts":"2025-12-13T12:34:57.000","event":"PARSE_OPTIONS_COMPLETE","ret":0,"nb_inputs":1,"nb_outputs":1}
+{"ts":"2025-12-13T12:34:57.050","event":"TRANSCODE_START"}
+{"ts":"2025-12-13T12:34:57.100","event":"INIT_START","output":"output.m3u8","nb_streams":1}
+{"ts":"2025-12-13T12:34:57.150","event":"SEGMENT_START","seq":0,"file":"segment0.ts"}
+{"ts":"2025-12-13T12:34:57.200","event":"INIT_COMPLETE","nb_varstreams":1}
+{"ts":"2025-12-13T12:34:57.250","event":"FIRST_PACKET","pts":0,"type":"video"}
 {"ts":"2025-12-13T12:35:03.200","event":"SEGMENT_COMPLETE","seq":0,"file":"segment0.ts","duration":6.006,"size":1234567}
 {"ts":"2025-12-13T12:35:03.201","event":"PLAYLIST_UPDATE","file":"output.m3u8","segments":1,"last":0}
-{"ts":"2025-12-13T12:35:03.202","event":"SEGMENT_START","seq":1,"file":"segment1.ts"}
 ```
 
 ### Usage Example
 
 ```bash
+# Set environment variable and run ffmpeg
+export FFMPEG_EVENTS_LOG=/var/log/ffmpeg/events.log
+
 ffmpeg -rtsp_transport tcp -i rtsp://camera/stream \
     -c:v auto_h264 \
     -f hls \
-    -hls_events_log /var/log/ffmpeg/events.log \
     playlist.m3u8
+
+# Or inline
+FFMPEG_EVENTS_LOG=/tmp/events.log ffmpeg -i input.mp4 -f hls output.m3u8
 ```
+
+### Timing Analysis
+
+The events log helps identify where time is spent:
+
+| Gap | What's happening |
+|-----|-----------------|
+| `PROCESS_START` → `PARSE_OPTIONS_START` | FFmpeg library initialization |
+| `PARSE_OPTIONS_START` → `RTSP_CONNECT_START` | Command line parsing |
+| `RTSP_CONNECT_START` → `RTSP_CONNECT_SUCCESS` | Network connection to camera |
+| `RTSP_CONNECT_SUCCESS` → `PARSE_OPTIONS_COMPLETE` | Stream probing, format detection |
+| `PARSE_OPTIONS_COMPLETE` → `TRANSCODE_START` | Encoder/muxer setup |
+| `TRANSCODE_START` → `FIRST_PACKET` | First frame processing |
 
 ### Log Size Estimation
 
@@ -442,6 +486,9 @@ This automatically applies:
 Complete example with all custom options explicitly specified:
 
 ```bash
+# Enable events logging via environment variable
+export FFMPEG_EVENTS_LOG=/var/log/ffmpeg/events.log
+
 ffmpeg \
     -hide_banner -loglevel info \
     -rtsp_transport tcp \
@@ -463,7 +510,6 @@ ffmpeg \
     -hls_drift_window "1,30,300,900" \
     -hls_drift_min_threshold "300:-2,900:-5" \
     -hls_drift_max_threshold "30:2,300:5" \
-    -hls_events_log /var/log/ffmpeg/events.log \
     -timeout 10000000 \
     -ignore_io_errors 0 \
     playlist.m3u8
@@ -490,7 +536,7 @@ ffmpeg \
 | **Monitoring** | `hls_drift_window` | **"1,30,300,900"** | Multiple averaging windows |
 | **Monitoring** | `hls_drift_min_threshold` | NULL | Min drift thresholds per window |
 | **Monitoring** | `hls_drift_max_threshold` | NULL | Max drift thresholds per window |
-| **Logging** | `hls_events_log` | NULL | Events log file (JSON lines) |
+| **Logging** | `FFMPEG_EVENTS_LOG` (env) | - | Events log file path |
 | **Network** | `timeout` | -1 | Socket I/O timeout (microseconds) |
 | **Network** | `ignore_io_errors` | 0 | Ignore I/O errors |
 | **Network** | `http_persistent` | 0 | Persistent HTTP connections |
