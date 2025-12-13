@@ -23,7 +23,9 @@
 #include "config.h"
 #include "config_components.h"
 #include <stdint.h>
+#include <stdarg.h>
 #include <time.h>
+#include <sys/time.h>
 #include <string.h>
 #include <errno.h>
 #include <float.h>
@@ -361,11 +363,54 @@ typedef struct HLSContext {
 
     /* Graceful exit flag - when set, current segment is finished before exiting */
     int     graceful_exit_requested;  /* 1 if graceful exit is pending */
+
+    /* Events log */
+    char   *events_log_path;          /* path to events log file (append mode) */
+    FILE   *events_log_fp;            /* file handle for events log */
 } HLSContext;
 
 static av_always_inline int hls_has_frame_outputs(const HLSContext *hls)
 {
     return hls->frame_output_path || hls->frame_buffer_output || hls->frame_meta_output_path;
+}
+
+/**
+ * Write an event to the events log file.
+ * Format: JSON lines with ISO8601 timestamp.
+ * 
+ * @param hls HLS context
+ * @param event Event name (e.g., "SEGMENT_START")
+ * @param fmt printf-style format for additional JSON fields (without leading comma)
+ *            Pass NULL if no additional fields needed.
+ */
+static void hls_log_event(HLSContext *hls, const char *event, const char *fmt, ...)
+{
+    struct timeval tv;
+    struct tm tm_info;
+    char ts_buf[64];
+    
+    if (!hls->events_log_fp)
+        return;
+    
+    gettimeofday(&tv, NULL);
+    localtime_r(&tv.tv_sec, &tm_info);
+    snprintf(ts_buf, sizeof(ts_buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03d",
+             tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
+             tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
+             (int)(tv.tv_usec / 1000));
+    
+    fprintf(hls->events_log_fp, "{\"ts\":\"%s\",\"event\":\"%s\"", ts_buf, event);
+    
+    if (fmt && fmt[0]) {
+        va_list args;
+        va_start(args, fmt);
+        fprintf(hls->events_log_fp, ",");
+        vfprintf(hls->events_log_fp, fmt, args);
+        va_end(args);
+    }
+    
+    fprintf(hls->events_log_fp, "}\n");
+    fflush(hls->events_log_fp);
 }
 
 static int strftime_expand(const char *fmt, char **dest)
@@ -709,6 +754,8 @@ static int hls_delete_old_segments(AVFormatContext *s, HLSContext *hls,
         proto = avio_find_protocol_name(s->url);
         if (ret = hls_delete_file(hls, s, path.str, proto))
             goto fail;
+
+        hls_log_event(hls, "SEGMENT_DELETE", "\"file\":\"%s\"", segment->filename);
 
         if ((segment->sub_filename[0] != '\0')) {
             vtt_dirname_r = av_strdup(vs->vtt_avf->url);
@@ -1241,8 +1288,14 @@ static int hls_append_segment(struct AVFormatContext *s, HLSContext *hls,
         vs->nb_entries++;
 
     if (hls->max_seg_size > 0) {
+        hls_log_event(hls, "SEGMENT_COMPLETE", "\"seq\":%"PRId64",\"file\":\"%s\",\"duration\":%.3f,\"size\":%"PRId64,
+                      vs->sequence, av_basename(vs->avf->url), duration, size);
         return 0;
     }
+
+    hls_log_event(hls, "SEGMENT_COMPLETE", "\"seq\":%"PRId64",\"file\":\"%s\",\"duration\":%.3f,\"size\":%"PRId64,
+                  vs->sequence, av_basename(vs->avf->url), duration, size);
+
     vs->sequence++;
 
     return 0;
@@ -1842,6 +1895,11 @@ fail:
         if (create_master_playlist(s, vs, last) < 0)
             av_log(s, AV_LOG_WARNING, "Master playlist creation failed\n");
 
+    if (ret >= 0) {
+        hls_log_event(hls, "PLAYLIST_UPDATE", "\"file\":\"%s\",\"segments\":%d,\"last\":%d",
+                      av_basename(vs->m3u8_name), vs->nb_entries, last);
+    }
+
     return ret;
 }
 
@@ -2029,6 +2087,9 @@ static int hls_start(AVFormatContext *s, VariantStream *vs)
                vs->segment_start_pts);
         vs->segment_start_pts = AV_NOPTS_VALUE;
     }
+
+    hls_log_event(c, "SEGMENT_START", "\"seq\":%"PRId64",\"file\":\"%s\"",
+                  vs->sequence, av_basename(oc->url));
 
     return 0;
 fail:
@@ -3148,8 +3209,11 @@ static int check_pts_discontinuity_and_update_drift(AVFormatContext *s, HLSConte
             av_log(s, AV_LOG_ERROR, "PTS discontinuity detected: prev_pts=%"PRId64", curr_pts=%"PRId64", diff=%.3f sec (thresholds: -%.3f / +%.3f)\n",
                    vs->prev_video_pts, pkt->pts, pts_diff_sec,
                    hls->pts_discontinuity_threshold_neg, hls->pts_discontinuity_threshold_pos);
+            hls_log_event(hls, "PTS_DISCONTINUITY", "\"prev_pts\":%"PRId64",\"curr_pts\":%"PRId64",\"diff_sec\":%.3f",
+                          vs->prev_video_pts, pkt->pts, pts_diff_sec);
             if (hls->pts_discontinuity_exit) {
                 av_log(s, AV_LOG_FATAL, "Requesting graceful exit due to PTS discontinuity (hls_pts_discontinuity_exit=1)\n");
+                hls_log_event(hls, "GRACEFUL_EXIT_REQUESTED", "\"reason\":\"pts_discontinuity\"");
                 hls->graceful_exit_requested = 1;
                 return 1;  /* Signal that graceful exit is requested */
             }
@@ -3252,6 +3316,9 @@ static int check_pts_discontinuity_and_update_drift(AVFormatContext *s, HLSConte
                 if (current_drift < threshold) {
                     av_log(s, AV_LOG_ERROR, "Drift threshold exceeded: drift%d=%.6f < %.6f (min threshold), requesting graceful exit\n",
                            window_size, current_drift, threshold);
+                    hls_log_event(hls, "DRIFT_THRESHOLD", "\"window\":%d,\"drift\":%.6f,\"threshold\":%.6f,\"type\":\"min\"",
+                                  window_size, current_drift, threshold);
+                    hls_log_event(hls, "GRACEFUL_EXIT_REQUESTED", "\"reason\":\"drift_min_threshold\"");
                     hls->graceful_exit_requested = 1;
                     return 1;  /* Signal that graceful exit is requested */
                 }
@@ -3266,6 +3333,9 @@ static int check_pts_discontinuity_and_update_drift(AVFormatContext *s, HLSConte
                 if (current_drift > threshold) {
                     av_log(s, AV_LOG_ERROR, "Drift threshold exceeded: drift%d=%.6f > %.6f (max threshold), requesting graceful exit\n",
                            window_size, current_drift, threshold);
+                    hls_log_event(hls, "DRIFT_THRESHOLD", "\"window\":%d,\"drift\":%.6f,\"threshold\":%.6f,\"type\":\"max\"",
+                                  window_size, current_drift, threshold);
+                    hls_log_event(hls, "GRACEFUL_EXIT_REQUESTED", "\"reason\":\"drift_max_threshold\"");
                     hls->graceful_exit_requested = 1;
                     return 1;  /* Signal that graceful exit is requested */
                 }
@@ -3291,6 +3361,11 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
     int use_temp_file = 0;
     VariantStream *vs = NULL;
     char *old_filename = NULL;
+
+    /* Safety check: if graceful exit was already requested, don't process any more packets */
+    if (hls->graceful_exit_requested) {
+        return AVERROR_EXIT;
+    }
 
     for (i = 0; i < hls->nb_varstreams; i++) {
         int subtitle_streams = 0;
@@ -3342,6 +3417,8 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
             if (hls->flags & HLS_PROGRAM_DATE_TIME)
                 vs->current_segment_pdt = vs->initial_prog_date_time + vs->run_total_duration;
         }
+        hls_log_event(hls, "FIRST_PACKET", "\"pts\":%"PRId64",\"type\":\"%s\"",
+                      pkt->pts, st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO ? "video" : "audio");
     }
     if (vs->start_pts_from_audio &&
         st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
@@ -3365,10 +3442,14 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
         is_ref_pkt = can_split = 0;
 
     /* Check for PTS discontinuity and update drift for video packets.
-     * If graceful exit is requested, the packet is still written to complete the current segment,
-     * and AVERROR_EXIT is returned at the end to trigger proper segment finalization. */
+     * If graceful exit is requested, return AVERROR_EXIT immediately WITHOUT writing
+     * the bad packet. The trailer will finalize the segment with only good data. */
     if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && vs) {
         check_pts_discontinuity_and_update_drift(s, hls, vs, pkt, st);
+        if (hls->graceful_exit_requested) {
+            av_log(s, AV_LOG_INFO, "Graceful exit: not writing packet with bad PTS, finalizing segment\n");
+            return AVERROR_EXIT;
+        }
     }
 
     /* Determine whether this packet should produce a decoded frame for auxiliary outputs.
@@ -3519,6 +3600,8 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
                 if (ret < 0) {
                     av_log(s, hls->ignore_io_errors ? AV_LOG_WARNING : AV_LOG_ERROR,
                            "Failed to open file '%s'\n", filename);
+                    hls_log_event(hls, "IO_ERROR", "\"op\":\"open\",\"file\":\"%s\",\"error\":%d",
+                                  av_basename(filename), ret);
                     av_freep(&filename);
                     av_dict_free(&options);
                     return hls->ignore_io_errors ? 0 : ret;
@@ -3537,6 +3620,8 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
                 if (ret < 0) {
                     av_log(s, AV_LOG_WARNING, "upload segment failed,"
                            " will retry with a new http session.\n");
+                    hls_log_event(hls, "SEGMENT_RETRY", "\"file\":\"%s\",\"error\":%d",
+                                  av_basename(filename), ret);
                     ff_format_io_close(s, &vs->out);
                     ret = hlsenc_io_open(s, &vs->out, filename, &options);
                     if (ret >= 0) {
@@ -3662,14 +3747,6 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
             ret = 0;
     }
 
-    /* Check if graceful exit was requested (by PTS discontinuity or drift threshold).
-     * Return AVERROR_EXIT to signal ffmpeg to call hls_write_trailer, which will
-     * properly finalize the current segment and write it to the playlist. */
-    if (hls->graceful_exit_requested) {
-        av_log(s, AV_LOG_INFO, "Graceful exit requested, finishing current segment before exit\n");
-        return AVERROR_EXIT;
-    }
-
     return ret;
 }
 
@@ -3721,6 +3798,11 @@ static void hls_deinit(AVFormatContext *s)
         fclose(hls->frame_meta_fp);
         hls->frame_meta_fp = NULL;
     }
+    if (hls->events_log_fp) {
+        fflush(hls->events_log_fp);
+        fclose(hls->events_log_fp);
+        hls->events_log_fp = NULL;
+    }
     av_freep(&hls->key_basename);
     av_freep(&hls->frame_output_path);
     av_freep(&hls->frame_meta_output_path);
@@ -3743,6 +3825,8 @@ static int hls_write_trailer(struct AVFormatContext *s)
     VariantStream *vs = NULL;
     AVDictionary *options = NULL;
     int range_length, byterange_mode;
+
+    hls_log_event(hls, "SHUTDOWN_START", "\"graceful_exit\":%d", hls->graceful_exit_requested);
 
     for (i = 0; i < hls->nb_varstreams; i++) {
         char *filename = NULL;
@@ -3866,6 +3950,8 @@ failed:
         av_free(old_filename);
     }
 
+    hls_log_event(hls, "SHUTDOWN_COMPLETE", NULL);
+
     return 0;
 }
 
@@ -3883,6 +3969,18 @@ static int hls_init(AVFormatContext *s)
     int http_base_proto = ff_is_http_proto(s->url);
     int fmp4_init_filename_len = strlen(hls->fmp4_init_filename) + 1;
     double initial_program_date_time = av_gettime() / 1000000.0;
+
+    /* Open events log file if configured */
+    if (hls->events_log_path) {
+        hls->events_log_fp = fopen(hls->events_log_path, "a");
+        if (!hls->events_log_fp) {
+            av_log(s, AV_LOG_WARNING, "Failed to open events log file '%s': %s\n",
+                   hls->events_log_path, strerror(errno));
+        } else {
+            hls_log_event(hls, "INIT_START", "\"output\":\"%s\",\"nb_streams\":%d",
+                          s->url, s->nb_streams);
+        }
+    }
 
     if (hls->use_localtime) {
         pattern = get_default_pattern_localtime_fmt(s);
@@ -4196,6 +4294,8 @@ static int hls_init(AVFormatContext *s)
         vs->number++;
     }
 
+    hls_log_event(hls, "INIT_COMPLETE", "\"nb_varstreams\":%d", hls->nb_varstreams);
+
     return ret;
 }
 
@@ -4274,6 +4374,7 @@ static const AVOption options[] = {
     {"hls_drift_window", "comma-separated list of drift averaging window sizes (e.g. 1,30,300,900)", OFFSET(drift_window_str), AV_OPT_TYPE_STRING, {.str = "1,30,300,900"}, 0, 0, E},
     {"hls_drift_min_threshold", "min drift thresholds per window (e.g. 300:-2,900:-5)", OFFSET(drift_min_threshold_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     {"hls_drift_max_threshold", "max drift thresholds per window (e.g. 30:2,300:5)", OFFSET(drift_max_threshold_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
+    {"hls_events_log", "path to events log file (append mode, JSON lines format)", OFFSET(events_log_path), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     /* Internal options for auto_h264 - set programmatically, not exposed in help */
     {"hls_input_codec", "input codec name (internal, set by auto_h264)", OFFSET(input_codec_name), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     {"hls_auto_h264_encode", "encoding mode flag (internal, set by auto_h264)", OFFSET(auto_h264_encode), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, E},

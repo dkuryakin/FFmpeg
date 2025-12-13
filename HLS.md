@@ -98,6 +98,61 @@ Optimized defaults for RTSP-to-HLS live streaming.
 - **omit_endlist**: Don't add #EXT-X-ENDLIST (for live streams)
 - **program_date_time**: Add #EXT-X-PROGRAM-DATE-TIME tags
 
+### Network/I/O Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `timeout` | duration | -1 (disabled) | Socket I/O operations timeout |
+| `ignore_io_errors` | bool | 0 | Ignore I/O errors for stable long-duration runs |
+| `http_persistent` | bool | 0 | Use persistent HTTP connections |
+| `headers` | string | NULL | Custom HTTP headers |
+
+#### timeout
+
+Sets timeout for socket I/O operations when writing segments/playlists to network destinations (HTTP, S3, etc.). Value is in microseconds.
+
+- **-1** (default): No timeout, wait indefinitely
+- **0**: Non-blocking mode
+- **>0**: Timeout in microseconds (e.g., `10000000` = 10 seconds)
+
+```bash
+# Set 10 second timeout for HTTP uploads
+ffmpeg ... -f hls -timeout 10000000 ...
+```
+
+#### ignore_io_errors
+
+When enabled, I/O errors during segment/playlist upload don't stop encoding. Useful for unreliable network connections where temporary failures are acceptable.
+
+- **0** (default): Stop on I/O errors
+- **1**: Log warning and continue encoding
+
+```bash
+# Continue even if segment upload fails
+ffmpeg ... -f hls -ignore_io_errors 1 ...
+```
+
+#### http_persistent
+
+Reuses HTTP connections instead of opening new connection for each segment. Reduces latency and overhead for HTTP output.
+
+- **0** (default): New connection per request
+- **1**: Keep connection alive between requests
+
+```bash
+# Use persistent HTTP connections
+ffmpeg ... -f hls -http_persistent 1 ...
+```
+
+#### headers
+
+Sets custom HTTP headers for all HTTP requests (segment uploads, playlist uploads). Can override default headers.
+
+```bash
+# Set custom authorization header
+ffmpeg ... -f hls -headers "Authorization: Bearer token123" ...
+```
+
 ---
 
 ## 3. Frame Output Options
@@ -182,7 +237,8 @@ Detects PTS (Presentation Timestamp) discontinuities in the input stream, useful
 - **Positive jump:** PTS jumps forward significantly (e.g., packet loss)
 
 When `hls_pts_discontinuity_exit=1` and a discontinuity is detected:
-- FFmpeg exits with error code
+- **Graceful exit:** Current segment is properly finished and written to playlist
+- FFmpeg exits with error code after segment finalization
 - Allows external process manager to restart the stream
 
 ### Disable Discontinuity Exit
@@ -245,7 +301,9 @@ When using `hls_frame_meta_output`, drift values for all windows are included:
 
 ### Drift Threshold Exit
 
-The `hls_drift_min_threshold` and `hls_drift_max_threshold` options allow setting exit thresholds per drift window. When a threshold is exceeded, FFmpeg exits with code 1.
+The `hls_drift_min_threshold` and `hls_drift_max_threshold` options allow setting exit thresholds per drift window. When a threshold is exceeded:
+- **Graceful exit:** Current segment is properly finished and written to playlist
+- FFmpeg exits with error code after segment finalization
 
 **Format:** `"window_size:threshold,window_size:threshold,..."`
 
@@ -277,7 +335,86 @@ ffmpeg ... -hls_drift_window "30,60,300,900,1800" ...
 
 ---
 
-## 6. Minimal Example
+## 6. Events Log
+
+**Location:** `libavformat/hlsenc.c`
+
+Append-only log file for tracking key control events during HLS encoding.
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `hls_events_log` | string | NULL | Path to events log file (append mode, JSON lines format) |
+
+### Events
+
+| Event | Description | Fields |
+|-------|-------------|--------|
+| `INIT_START` | HLS muxer initialization starts | output, nb_streams |
+| `INIT_COMPLETE` | Initialization completed | nb_varstreams |
+| `FIRST_PACKET` | First packet received | pts, type |
+| `SEGMENT_START` | New segment opened | seq, file |
+| `SEGMENT_COMPLETE` | Segment finalized | seq, file, duration, size |
+| `SEGMENT_DELETE` | Old segment removed | file |
+| `PLAYLIST_UPDATE` | Playlist written | file, segments, last |
+| `PTS_DISCONTINUITY` | PTS jump detected | prev_pts, curr_pts, diff_sec |
+| `DRIFT_THRESHOLD` | Drift threshold exceeded | window, drift, threshold, type |
+| `GRACEFUL_EXIT_REQUESTED` | Exit requested | reason |
+| `SEGMENT_RETRY` | Segment upload retry | file, error |
+| `IO_ERROR` | I/O error occurred | op, file, error |
+| `SHUTDOWN_START` | Shutdown begins | graceful_exit |
+| `SHUTDOWN_COMPLETE` | Shutdown finished | - |
+
+### Log Format (JSON Lines)
+
+Each line is a valid JSON object with ISO8601 timestamp:
+
+```json
+{"ts":"2025-12-13T12:34:56.789","event":"INIT_START","output":"output.m3u8","nb_streams":2}
+{"ts":"2025-12-13T12:34:56.790","event":"INIT_COMPLETE","nb_varstreams":1}
+{"ts":"2025-12-13T12:34:57.100","event":"FIRST_PACKET","pts":0,"type":"video"}
+{"ts":"2025-12-13T12:34:57.100","event":"SEGMENT_START","seq":0,"file":"segment0.ts"}
+{"ts":"2025-12-13T12:35:03.200","event":"SEGMENT_COMPLETE","seq":0,"file":"segment0.ts","duration":6.006,"size":1234567}
+{"ts":"2025-12-13T12:35:03.201","event":"PLAYLIST_UPDATE","file":"output.m3u8","segments":1,"last":0}
+{"ts":"2025-12-13T12:35:03.202","event":"SEGMENT_START","seq":1,"file":"segment1.ts"}
+```
+
+### Usage Example
+
+```bash
+ffmpeg -rtsp_transport tcp -i rtsp://camera/stream \
+    -c:v auto_h264 \
+    -f hls \
+    -hls_events_log /var/log/ffmpeg/events.log \
+    playlist.m3u8
+```
+
+### Log Size Estimation
+
+- ~200 bytes per event
+- At 6-second segments: ~600 events/hour
+- **~120 KB/hour** or **~3 MB/day**
+
+---
+
+## 7. Graceful Exit Behavior
+
+**Location:** `libavformat/hlsenc.c`
+
+When exit is triggered by PTS discontinuity or drift threshold:
+
+1. **Bad packet is NOT written** — the packet that triggered the exit is discarded
+2. Current segment is properly finalized with only good data
+3. Segment is added to the playlist
+4. `hls_write_trailer` is called for proper cleanup
+5. FFmpeg exits with error code
+
+This ensures segment integrity — the last segment contains only valid data without discontinuities.
+
+---
+
+## 8. Minimal Example
 
 With the new defaults, a minimal RTSP-to-HLS command is simply:
 
@@ -294,12 +431,13 @@ This automatically applies:
 - 1 second segments
 - Infinite playlist
 - Live streaming flags (append_list, omit_endlist, program_date_time)
-- PTS discontinuity detection with exit
+- PTS discontinuity detection with graceful exit
 - Drift monitoring
+- Graceful exit on errors (segment properly finalized)
 
 ---
 
-## 7. Full Example with All Options
+## 9. Full Example with All Options
 
 Complete example with all custom options explicitly specified:
 
@@ -325,6 +463,9 @@ ffmpeg \
     -hls_drift_window "1,30,300,900" \
     -hls_drift_min_threshold "300:-2,900:-5" \
     -hls_drift_max_threshold "30:2,300:5" \
+    -hls_events_log /var/log/ffmpeg/events.log \
+    -timeout 10000000 \
+    -ignore_io_errors 0 \
     playlist.m3u8
 ```
 
@@ -349,3 +490,7 @@ ffmpeg \
 | **Monitoring** | `hls_drift_window` | **"1,30,300,900"** | Multiple averaging windows |
 | **Monitoring** | `hls_drift_min_threshold` | NULL | Min drift thresholds per window |
 | **Monitoring** | `hls_drift_max_threshold` | NULL | Max drift thresholds per window |
+| **Logging** | `hls_events_log` | NULL | Events log file (JSON lines) |
+| **Network** | `timeout` | -1 | Socket I/O timeout (microseconds) |
+| **Network** | `ignore_io_errors` | 0 | Ignore I/O errors |
+| **Network** | `http_persistent` | 0 | Persistent HTTP connections |
