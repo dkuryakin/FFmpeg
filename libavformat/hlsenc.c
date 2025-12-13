@@ -1288,13 +1288,17 @@ static int hls_append_segment(struct AVFormatContext *s, HLSContext *hls,
         vs->nb_entries++;
 
     if (hls->max_seg_size > 0) {
-        hls_log_event(hls, "SEGMENT_COMPLETE", "\"seq\":%"PRId64",\"file\":\"%s\",\"duration\":%.3f,\"size\":%"PRId64,
-                      vs->sequence, av_basename(vs->avf->url), duration, size);
+        /* Don't log SEGMENT_COMPLETE for segments restored from existing playlist */
+        if (!vs->restoring_from_playlist)
+            hls_log_event(hls, "SEGMENT_COMPLETE", "\"seq\":%"PRId64",\"file\":\"%s\",\"duration\":%.3f,\"size\":%"PRId64,
+                          vs->sequence, av_basename(vs->avf->url), duration, size);
         return 0;
     }
 
-    hls_log_event(hls, "SEGMENT_COMPLETE", "\"seq\":%"PRId64",\"file\":\"%s\",\"duration\":%.3f,\"size\":%"PRId64,
-                  vs->sequence, av_basename(vs->avf->url), duration, size);
+    /* Don't log SEGMENT_COMPLETE for segments restored from existing playlist */
+    if (!vs->restoring_from_playlist)
+        hls_log_event(hls, "SEGMENT_COMPLETE", "\"seq\":%"PRId64",\"file\":\"%s\",\"duration\":%.3f,\"size\":%"PRId64,
+                      vs->sequence, av_basename(vs->avf->url), duration, size);
 
     vs->sequence++;
 
