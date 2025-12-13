@@ -358,6 +358,9 @@ typedef struct HLSContext {
     /* Internal options for auto_h264 (set programmatically, not via CLI) */
     char   *input_codec_name;         /* original input codec name (e.g. "hevc", "h264") */
     int     auto_h264_encode;         /* 1 if re-encoding via auto_h264, 0 if stream copy */
+
+    /* Graceful exit flag - when set, current segment is finished before exiting */
+    int     graceful_exit_requested;  /* 1 if graceful exit is pending */
 } HLSContext;
 
 static av_always_inline int hls_has_frame_outputs(const HLSContext *hls)
@@ -3146,8 +3149,9 @@ static int check_pts_discontinuity_and_update_drift(AVFormatContext *s, HLSConte
                    vs->prev_video_pts, pkt->pts, pts_diff_sec,
                    hls->pts_discontinuity_threshold_neg, hls->pts_discontinuity_threshold_pos);
             if (hls->pts_discontinuity_exit) {
-                av_log(s, AV_LOG_FATAL, "Exiting due to PTS discontinuity (hls_pts_discontinuity_exit=1)\n");
-                return 1;  /* Signal to exit */
+                av_log(s, AV_LOG_FATAL, "Requesting graceful exit due to PTS discontinuity (hls_pts_discontinuity_exit=1)\n");
+                hls->graceful_exit_requested = 1;
+                return 1;  /* Signal that graceful exit is requested */
             }
         }
     }
@@ -3246,9 +3250,10 @@ static int check_pts_discontinuity_and_update_drift(AVFormatContext *s, HLSConte
             if (hls->drift_min_thresholds[j].window_size == window_size) {
                 double threshold = hls->drift_min_thresholds[j].threshold;
                 if (current_drift < threshold) {
-                    av_log(s, AV_LOG_ERROR, "Drift threshold exceeded: drift%d=%.6f < %.6f (min threshold), exiting\n",
+                    av_log(s, AV_LOG_ERROR, "Drift threshold exceeded: drift%d=%.6f < %.6f (min threshold), requesting graceful exit\n",
                            window_size, current_drift, threshold);
-                    exit(1);
+                    hls->graceful_exit_requested = 1;
+                    return 1;  /* Signal that graceful exit is requested */
                 }
                 break;
             }
@@ -3259,9 +3264,10 @@ static int check_pts_discontinuity_and_update_drift(AVFormatContext *s, HLSConte
             if (hls->drift_max_thresholds[j].window_size == window_size) {
                 double threshold = hls->drift_max_thresholds[j].threshold;
                 if (current_drift > threshold) {
-                    av_log(s, AV_LOG_ERROR, "Drift threshold exceeded: drift%d=%.6f > %.6f (max threshold), exiting\n",
+                    av_log(s, AV_LOG_ERROR, "Drift threshold exceeded: drift%d=%.6f > %.6f (max threshold), requesting graceful exit\n",
                            window_size, current_drift, threshold);
-                    exit(1);
+                    hls->graceful_exit_requested = 1;
+                    return 1;  /* Signal that graceful exit is requested */
                 }
                 break;
             }
@@ -3358,13 +3364,11 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
     if (pkt->pts == AV_NOPTS_VALUE)
         is_ref_pkt = can_split = 0;
 
-    /* Check for PTS discontinuity and update drift for video packets */
+    /* Check for PTS discontinuity and update drift for video packets.
+     * If graceful exit is requested, the packet is still written to complete the current segment,
+     * and AVERROR_EXIT is returned at the end to trigger proper segment finalization. */
     if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && vs) {
-        int discontinuity_exit = check_pts_discontinuity_and_update_drift(s, hls, vs, pkt, st);
-        if (discontinuity_exit) {
-            /* PTS discontinuity detected and exit requested - don't save frame, exit immediately */
-            exit(1);
-        }
+        check_pts_discontinuity_and_update_drift(s, hls, vs, pkt, st);
     }
 
     /* Determine whether this packet should produce a decoded frame for auxiliary outputs.
@@ -3656,6 +3660,14 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
         }
         if (hls->ignore_io_errors)
             ret = 0;
+    }
+
+    /* Check if graceful exit was requested (by PTS discontinuity or drift threshold).
+     * Return AVERROR_EXIT to signal ffmpeg to call hls_write_trailer, which will
+     * properly finalize the current segment and write it to the playlist. */
+    if (hls->graceful_exit_requested) {
+        av_log(s, AV_LOG_INFO, "Graceful exit requested, finishing current segment before exit\n");
+        return AVERROR_EXIT;
     }
 
     return ret;
