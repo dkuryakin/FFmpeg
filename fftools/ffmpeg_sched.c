@@ -39,6 +39,7 @@
 #include "libavutil/thread.h"
 #include "libavutil/threadmessage.h"
 #include "libavutil/time.h"
+#include "libavutil/events_log.h"
 
 // 100 ms
 // FIXME: some other value? make this dynamic?
@@ -1700,13 +1701,16 @@ int sch_start(Scheduler *sch)
 {
     int ret;
 
+    ff_log_event("SCH_PREPARE_START", NULL);
     ret = start_prepare(sch);
     if (ret < 0)
         return ret;
+    ff_log_event("SCH_PREPARE_DONE", NULL);
 
     av_assert0(sch->state == SCH_STATE_UNINIT);
     sch->state = SCH_STATE_STARTED;
 
+    ff_log_event("SCH_MUX_INIT_START", "\"nb_mux\":%u", sch->nb_mux);
     for (unsigned i = 0; i < sch->nb_mux; i++) {
         SchMux *mux = &sch->mux[i];
 
@@ -1716,7 +1720,9 @@ int sch_start(Scheduler *sch)
                 goto fail;
         }
     }
+    ff_log_event("SCH_MUX_INIT_DONE", NULL);
 
+    ff_log_event("SCH_ENC_START", "\"nb_enc\":%u", sch->nb_enc);
     for (unsigned i = 0; i < sch->nb_enc; i++) {
         SchEnc *enc = &sch->enc[i];
 
@@ -1724,7 +1730,9 @@ int sch_start(Scheduler *sch)
         if (ret < 0)
             goto fail;
     }
+    ff_log_event("SCH_ENC_DONE", NULL);
 
+    ff_log_event("SCH_FILTER_START", "\"nb_filters\":%u", sch->nb_filters);
     for (unsigned i = 0; i < sch->nb_filters; i++) {
         SchFilterGraph *fg = &sch->filters[i];
 
@@ -1732,7 +1740,9 @@ int sch_start(Scheduler *sch)
         if (ret < 0)
             goto fail;
     }
+    ff_log_event("SCH_FILTER_DONE", NULL);
 
+    ff_log_event("SCH_DEC_START", "\"nb_dec\":%u", sch->nb_dec);
     for (unsigned i = 0; i < sch->nb_dec; i++) {
         SchDec *dec = &sch->dec[i];
 
@@ -1740,7 +1750,9 @@ int sch_start(Scheduler *sch)
         if (ret < 0)
             goto fail;
     }
+    ff_log_event("SCH_DEC_DONE", NULL);
 
+    ff_log_event("SCH_DEMUX_START", "\"nb_demux\":%u", sch->nb_demux);
     for (unsigned i = 0; i < sch->nb_demux; i++) {
         SchDemux *d = &sch->demux[i];
 
@@ -1751,11 +1763,13 @@ int sch_start(Scheduler *sch)
         if (ret < 0)
             goto fail;
     }
+    ff_log_event("SCH_DEMUX_DONE", NULL);
 
     pthread_mutex_lock(&sch->schedule_lock);
     schedule_update_locked(sch);
     pthread_mutex_unlock(&sch->schedule_lock);
 
+    ff_log_event("SCH_START_COMPLETE", NULL);
     return 0;
 fail:
     sch_stop(sch, NULL);

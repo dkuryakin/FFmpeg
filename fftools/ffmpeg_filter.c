@@ -39,6 +39,7 @@
 #include "libavutil/samplefmt.h"
 #include "libavutil/time.h"
 #include "libavutil/timestamp.h"
+#include "libavutil/events_log.h"
 
 // FIXME private header, used for mid_pred()
 #include "libavcodec/mathops.h"
@@ -3283,6 +3284,10 @@ static int filter_thread(void *arg)
 
     FilterGraphThread fgt;
     int ret = 0, input_status = 0;
+    int first_frame_logged = 0;
+
+    ff_log_event("FILTER_THREAD_START", "\"nb_inputs\":%d,\"nb_outputs\":%d",
+                 fg->nb_inputs, fg->nb_outputs);
 
     ret = fg_thread_init(&fgt, fg);
     if (ret < 0)
@@ -3292,7 +3297,9 @@ static int filter_thread(void *arg)
 
     // if we have all input parameters the graph can now be configured
     if (ifilter_has_all_input_formats(fg)) {
+        ff_log_event("FILTER_CONFIGURE_START", NULL);
         ret = configure_filtergraph(fg, &fgt);
+        ff_log_event("FILTER_CONFIGURE_DONE", "\"ret\":%d", ret);
         if (ret < 0) {
             av_log(fg, AV_LOG_ERROR, "Error configuring filter graph: %s\n",
                    av_err2str(ret));
@@ -3318,7 +3325,10 @@ static int filter_thread(void *arg)
         }
         av_assert0(input_status >= 0);
 
-        o = (intptr_t)fgt.frame->opaque;
+        if (!first_frame_logged && fgt.frame->buf[0]) {
+            ff_log_event("FILTER_FIRST_FRAME", "\"pts\":%"PRId64, fgt.frame->pts);
+            first_frame_logged = 1;
+        }
 
         o = (intptr_t)fgt.frame->opaque;
 

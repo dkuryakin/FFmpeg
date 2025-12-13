@@ -30,6 +30,7 @@
 #include "libavutil/stereo3d.h"
 #include "libavutil/time.h"
 #include "libavutil/timestamp.h"
+#include "libavutil/events_log.h"
 
 #include "libavcodec/avcodec.h"
 #include "libavcodec/codec.h"
@@ -916,6 +917,10 @@ static int decoder_thread(void *arg)
     DecoderPriv  *dp = arg;
     DecThreadContext dt;
     int ret = 0, input_status = 0;
+    int first_packet_logged = 0;
+
+    ff_log_event("DEC_THREAD_START", "\"codec\":\"%s\"",
+                 dp->dec_ctx ? avcodec_get_name(dp->dec_ctx->codec_id) : "unknown");
 
     ret = dec_thread_init(&dt);
     if (ret < 0)
@@ -935,6 +940,10 @@ static int decoder_thread(void *arg)
         if (!have_data)
             av_log(dp, AV_LOG_VERBOSE, "Decoder thread received %s packet\n",
                    flush_buffers ? "flush" : "EOF");
+        if (have_data && !first_packet_logged) {
+            ff_log_event("DEC_FIRST_PACKET", "\"size\":%d", dt.pkt->size);
+            first_packet_logged = 1;
+        }
 
         // this is a standalone decoder that has not been initialized yet
         if (!dp->dec_ctx) {

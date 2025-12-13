@@ -2012,7 +2012,9 @@ redirect:
                        "CompanyID: KnKV4M4I/B2FjJ1TToLycw==\r\n"
                        "GUID: 00000000-0000-0000-0000-000000000000\r\n",
                        sizeof(cmd));
+        ff_log_event("RTSP_OPTIONS_START", NULL);
         ff_rtsp_send_cmd(s, "OPTIONS", rt->control_uri, cmd, reply, NULL);
+        ff_log_event("RTSP_OPTIONS_DONE", "\"status\":%d", reply->status_code);
         if (reply->status_code != RTSP_STATUS_OK) {
             err = ff_rtsp_averror(reply->status_code, AVERROR_INVALIDDATA);
             goto fail;
@@ -2031,10 +2033,12 @@ redirect:
 
 #if CONFIG_RTSP_DEMUXER
     if (s->iformat) {
+        ff_log_event("RTSP_DESCRIBE_START", NULL);
         if (rt->server_type == RTSP_SERVER_SATIP)
             err = init_satip_stream(s);
         else
             err = ff_rtsp_setup_input_streams(s, reply);
+        ff_log_event("RTSP_DESCRIBE_DONE", "\"ret\":%d", err);
     } else
 #endif
            if (CONFIG_RTSP_MUXER)
@@ -2044,6 +2048,7 @@ redirect:
     if (err)
         goto fail;
 
+    ff_log_event("RTSP_SETUP_START", NULL);
     do {
         int lower_transport = ff_log2_tab[lower_transport_mask &
                                   ~(lower_transport_mask - 1)];
@@ -2063,6 +2068,7 @@ redirect:
             goto fail;
         }
     } while (err);
+    ff_log_event("RTSP_SETUP_DONE", "\"nb_streams\":%d", rt->nb_rtsp_streams);
 
     rt->lower_transport_mask = lower_transport_mask;
     av_strlcpy(rt->real_challenge, real_challenge, sizeof(rt->real_challenge));

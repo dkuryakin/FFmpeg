@@ -35,6 +35,7 @@
 #include "libavutil/rational.h"
 #include "libavutil/time.h"
 #include "libavutil/timestamp.h"
+#include "libavutil/events_log.h"
 
 #include "libavcodec/avcodec.h"
 
@@ -865,6 +866,10 @@ int encoder_thread(void *arg)
     EncoderThread et;
     int ret = 0, input_status = 0;
     int name_set = 0;
+    int first_frame_logged = 0;
+
+    ff_log_event("ENC_THREAD_START", "\"type\":\"%s\"",
+                 av_get_media_type_string(ost->type));
 
     ret = enc_thread_init(&et);
     if (ret < 0)
@@ -904,6 +909,11 @@ int encoder_thread(void *arg)
         if (!name_set) {
             enc_thread_set_name(ost);
             name_set = 1;
+        }
+        if (!first_frame_logged) {
+            ff_log_event("ENC_FIRST_FRAME", "\"type\":\"%s\",\"pts\":%"PRId64,
+                         av_get_media_type_string(ost->type), et.frame->pts);
+            first_frame_logged = 1;
         }
 
         ret = frame_encode(ost, et.frame, et.pkt);

@@ -367,6 +367,11 @@ Append-only log file for tracking key control events during FFmpeg execution. En
 | `INPUT_OPEN_SUCCESS` | Input opened successfully | file, format, nb_streams |
 | `INPUT_OPEN_FAILED` | Input open failed | file, error |
 | `PROBE_START` | Stream probing begins | nb_streams |
+| `PROBE_LOOP_START` | Probe main loop starts | nb_streams, probesize, analyze_duration |
+| `PROBE_PROGRESS` | Probe progress (every 50 packets) | packets, bytes |
+| `PROBE_ALL_FOUND` | All stream params found | packets, bytes |
+| `PROBE_SIZE_LIMIT` | Probesize limit reached | packets, bytes, limit |
+| `PROBE_EOF` | EOF/error during probing | packets, bytes, ret |
 | `PROBE_COMPLETE` | Stream probing finished | ret, nb_streams |
 
 #### RTSP events (rtsp.c)
@@ -376,6 +381,53 @@ Append-only log file for tracking key control events during FFmpeg execution. En
 | `RTSP_CONNECT_START` | Starting RTSP connection | host, port |
 | `RTSP_CONNECT_SUCCESS` | RTSP connection established | host, port |
 | `RTSP_CONNECT_FAILED` | RTSP connection failed | host, port, error |
+| `RTSP_OPTIONS_START` | Sending OPTIONS command | - |
+| `RTSP_OPTIONS_DONE` | OPTIONS response received | status |
+| `RTSP_DESCRIBE_START` | Sending DESCRIBE command | - |
+| `RTSP_DESCRIBE_DONE` | DESCRIBE/SDP parsed | ret |
+| `RTSP_SETUP_START` | Starting SETUP for streams | - |
+| `RTSP_SETUP_DONE` | All streams setup | nb_streams |
+
+#### Scheduler events (ffmpeg_sched.c)
+
+| Event | Description | Fields |
+|-------|-------------|--------|
+| `SCH_PREPARE_START` | Scheduler preparation | - |
+| `SCH_PREPARE_DONE` | Preparation complete | - |
+| `SCH_MUX_INIT_START` | Muxer initialization | nb_mux |
+| `SCH_MUX_INIT_DONE` | Muxers initialized | - |
+| `SCH_ENC_START` | Encoder threads starting | nb_enc |
+| `SCH_ENC_DONE` | Encoders started | - |
+| `SCH_FILTER_START` | Filter graphs starting | nb_filters |
+| `SCH_FILTER_DONE` | Filters started | - |
+| `SCH_DEC_START` | Decoder threads starting | nb_dec |
+| `SCH_DEC_DONE` | Decoders started | - |
+| `SCH_DEMUX_START` | Demuxer threads starting | nb_demux |
+| `SCH_DEMUX_DONE` | Demuxers started | - |
+| `SCH_START_COMPLETE` | Scheduler fully started | - |
+
+#### Decoder events (ffmpeg_dec.c)
+
+| Event | Description | Fields |
+|-------|-------------|--------|
+| `DEC_THREAD_START` | Decoder thread started | codec |
+| `DEC_FIRST_PACKET` | First packet received by decoder | size |
+
+#### Encoder events (ffmpeg_enc.c)
+
+| Event | Description | Fields |
+|-------|-------------|--------|
+| `ENC_THREAD_START` | Encoder thread started | type |
+| `ENC_FIRST_FRAME` | First frame received by encoder | type, pts |
+
+#### Filter events (ffmpeg_filter.c)
+
+| Event | Description | Fields |
+|-------|-------------|--------|
+| `FILTER_THREAD_START` | Filter thread started | nb_inputs, nb_outputs |
+| `FILTER_CONFIGURE_START` | Filter graph configuration starting | - |
+| `FILTER_CONFIGURE_DONE` | Filter graph configured | ret |
+| `FILTER_FIRST_FRAME` | First frame through filter | pts |
 
 #### HLS muxer events (hlsenc.c)
 
@@ -443,10 +495,17 @@ The events log helps identify where time is spent:
 | `RTSP_CONNECT_START` → `RTSP_CONNECT_SUCCESS` | TCP connection to camera |
 | `RTSP_CONNECT_SUCCESS` → `INPUT_OPEN_SUCCESS` | RTSP handshake (DESCRIBE, SETUP, PLAY) |
 | `INPUT_OPEN_SUCCESS` → `PROBE_START` | Codec selection setup |
-| `PROBE_START` → `PROBE_COMPLETE` | **Reading packets to detect stream params** |
+| `PROBE_START` → `PROBE_LOOP_START` | Decoder initialization |
+| `PROBE_LOOP_START` → `PROBE_ALL_FOUND` | **Reading packets to detect stream params** |
+| `PROBE_ALL_FOUND` → `PROBE_COMPLETE` | Post-processing, flush codecs |
 | `PROBE_COMPLETE` → `PARSE_OPTIONS_COMPLETE` | Output file setup |
 | `PARSE_OPTIONS_COMPLETE` → `TRANSCODE_START` | Encoder/muxer initialization |
-| `TRANSCODE_START` → `FIRST_PACKET` | First frame processing |
+| `TRANSCODE_START` → `SCH_START_COMPLETE` | Scheduler startup |
+| `SCH_START_COMPLETE` → `DEC_FIRST_PACKET` | **Waiting for first packet from demuxer** |
+| `DEC_FIRST_PACKET` → `FILTER_FIRST_FRAME` | Decoding first frame |
+| `FILTER_FIRST_FRAME` → `ENC_FIRST_FRAME` | Filter processing |
+| `ENC_FIRST_FRAME` → `INIT_START` | **Encoding first frame** |
+| `INIT_START` → `FIRST_PACKET` | HLS muxer initialization |
 
 ### Log Size Estimation
 

@@ -26,6 +26,7 @@
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/dict.h"
+#include "libavutil/events_log.h"
 #include "libavutil/internal.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
@@ -2669,6 +2670,8 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
     }
 
     read_size = 0;
+    ff_log_event("PROBE_LOOP_START", "\"nb_streams\":%d,\"probesize\":%"PRId64",\"analyze_duration\":%"PRId64,
+                 ic->nb_streams, probesize, max_analyze_duration);
     for (;;) {
         const AVPacket *pkt;
         AVStream *st;
@@ -2735,6 +2738,7 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
                 /* If we found the info for all the codecs, we can stop. */
                 ret = count;
                 av_log(ic, AV_LOG_DEBUG, "All info found\n");
+                ff_log_event("PROBE_ALL_FOUND", "\"packets\":%d,\"bytes\":%"PRId64, count, read_size);
                 flush_codecs = 0;
                 break;
             }
@@ -2744,6 +2748,8 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
             ret = count;
             av_log(ic, AV_LOG_DEBUG,
                    "Probe buffer size limit of %"PRId64" bytes reached\n", probesize);
+            ff_log_event("PROBE_SIZE_LIMIT", "\"packets\":%d,\"bytes\":%"PRId64",\"limit\":%"PRId64,
+                         count, read_size, probesize);
             for (unsigned i = 0; i < ic->nb_streams; i++) {
                 AVStream *const st  = ic->streams[i];
                 FFStream *const sti = ffstream(st);
@@ -2766,6 +2772,7 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
 
         if (ret < 0) {
             /* EOF or error*/
+            ff_log_event("PROBE_EOF", "\"packets\":%d,\"bytes\":%"PRId64",\"ret\":%d", count, read_size, ret);
             eof_reached = 1;
             break;
         }
@@ -2904,6 +2911,11 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
 
         sti->codec_info_nb_frames++;
         count++;
+
+        /* Log progress every 50 packets */
+        if (count % 50 == 0) {
+            ff_log_event("PROBE_PROGRESS", "\"packets\":%d,\"bytes\":%"PRId64, count, read_size);
+        }
     }
 
     if (eof_reached) {
