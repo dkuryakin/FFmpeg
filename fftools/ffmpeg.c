@@ -68,55 +68,13 @@
 #include <conio.h>
 #endif
 
-#include <stdarg.h>
-#include <sys/time.h>
-
 #include "libavutil/bprint.h"
 #include "libavutil/dict.h"
+#include "libavutil/events_log.h"
 #include "libavutil/mem.h"
 #include "libavutil/time.h"
 
 #include "libavformat/avformat.h"
-
-/**
- * Log an event to FFMPEG_EVENTS_LOG file (if set via environment variable).
- * Used for process-level events that happen outside of muxers.
- */
-static void ffmpeg_log_event(const char *event, const char *fmt, ...)
-{
-    const char *log_path = getenv("FFMPEG_EVENTS_LOG");
-    struct timeval tv;
-    struct tm tm_info;
-    char ts_buf[64];
-    FILE *fp;
-
-    if (!log_path || !log_path[0])
-        return;
-
-    fp = fopen(log_path, "a");
-    if (!fp)
-        return;
-
-    gettimeofday(&tv, NULL);
-    localtime_r(&tv.tv_sec, &tm_info);
-    snprintf(ts_buf, sizeof(ts_buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03d",
-             tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
-             tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
-             (int)(tv.tv_usec / 1000));
-
-    fprintf(fp, "{\"ts\":\"%s\",\"event\":\"%s\"", ts_buf, event);
-
-    if (fmt && fmt[0]) {
-        va_list args;
-        va_start(args, fmt);
-        fprintf(fp, ",");
-        vfprintf(fp, fmt, args);
-        va_end(args);
-    }
-
-    fprintf(fp, "}\n");
-    fclose(fp);
-}
 
 #include "libavdevice/avdevice.h"
 
@@ -1027,7 +985,7 @@ int main(int argc, char **argv)
     int ret;
     BenchmarkTimeStamps ti;
 
-    ffmpeg_log_event("PROCESS_START", "\"pid\":%d", (int)getpid());
+    ff_log_event("PROCESS_START", "\"pid\":%d", (int)getpid());
 
     init_dynload();
 
@@ -1050,9 +1008,9 @@ int main(int argc, char **argv)
     }
 
     /* parse options and open all input/output files */
-    ffmpeg_log_event("PARSE_OPTIONS_START", NULL);
+    ff_log_event("PARSE_OPTIONS_START", NULL);
     ret = ffmpeg_parse_options(argc, argv, sch);
-    ffmpeg_log_event("PARSE_OPTIONS_COMPLETE", "\"ret\":%d,\"nb_inputs\":%d,\"nb_outputs\":%d",
+    ff_log_event("PARSE_OPTIONS_COMPLETE", "\"ret\":%d,\"nb_inputs\":%d,\"nb_outputs\":%d",
                      ret, nb_input_files, nb_output_files);
     if (ret < 0)
         goto finish;
@@ -1075,7 +1033,7 @@ int main(int argc, char **argv)
 #endif
 
     current_time = ti = get_benchmark_time_stamps();
-    ffmpeg_log_event("TRANSCODE_START", NULL);
+    ff_log_event("TRANSCODE_START", NULL);
     ret = transcode(sch);
     if (ret >= 0 && do_benchmark) {
         int64_t utime, stime, rtime;
@@ -1102,7 +1060,7 @@ finish:
     av_log(NULL, AV_LOG_VERBOSE, "\n");
     av_log(NULL, AV_LOG_VERBOSE, "Exiting with exit code %d\n", ret);
 
-    ffmpeg_log_event("PROCESS_END", "\"ret\":%d", ret);
+    ff_log_event("PROCESS_END", "\"ret\":%d", ret);
 
     return ret;
 }

@@ -27,6 +27,7 @@
 #include "libavutil/avstring.h"
 #include "libavutil/display.h"
 #include "libavutil/error.h"
+#include "libavutil/events_log.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
@@ -1951,8 +1952,10 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
         scan_all_pmts_set = 1;
     }
     /* open the input file with generic avformat function */
+    ff_log_event("INPUT_OPEN_START", "\"file\":\"%s\"", filename);
     err = avformat_open_input(&ic, filename, file_iformat, &o->g->format_opts);
     if (err < 0) {
+        ff_log_event("INPUT_OPEN_FAILED", "\"file\":\"%s\",\"error\":%d", filename, err);
         if (err != AVERROR_EXIT)
             av_log(d, AV_LOG_ERROR,
                    "Error opening input: %s\n", av_err2str(err));
@@ -1960,6 +1963,8 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
             av_log(d, AV_LOG_ERROR, "Did you mean file:%s?\n", filename);
         return err;
     }
+    ff_log_event("INPUT_OPEN_SUCCESS", "\"file\":\"%s\",\"format\":\"%s\",\"nb_streams\":%d",
+                    filename, ic->iformat->name, ic->nb_streams);
     f->ctx = ic;
 
     av_strlcat(d->log_name, "/",               sizeof(d->log_name));
@@ -1992,7 +1997,9 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
 
         /* If not enough info to get the stream parameters, we decode the
            first frames to get it. (used in mpeg case for example) */
+        ff_log_event("PROBE_START", "\"nb_streams\":%d", ic->nb_streams);
         ret = avformat_find_stream_info(ic, opts);
+        ff_log_event("PROBE_COMPLETE", "\"ret\":%d,\"nb_streams\":%d", ret, ic->nb_streams);
 
         for (int i = 0; i < orig_nb_streams; i++)
             av_dict_free(&opts[i]);

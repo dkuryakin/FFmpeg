@@ -359,6 +359,16 @@ Append-only log file for tracking key control events during FFmpeg execution. En
 | `TRANSCODE_START` | Transcoding begins | - |
 | `PROCESS_END` | FFmpeg process ending | ret |
 
+#### Input events (ffmpeg_demux.c)
+
+| Event | Description | Fields |
+|-------|-------------|--------|
+| `INPUT_OPEN_START` | Starting to open input | file |
+| `INPUT_OPEN_SUCCESS` | Input opened successfully | file, format, nb_streams |
+| `INPUT_OPEN_FAILED` | Input open failed | file, error |
+| `PROBE_START` | Stream probing begins | nb_streams |
+| `PROBE_COMPLETE` | Stream probing finished | ret, nb_streams |
+
 #### RTSP events (rtsp.c)
 
 | Event | Description | Fields |
@@ -428,10 +438,14 @@ The events log helps identify where time is spent:
 | Gap | What's happening |
 |-----|-----------------|
 | `PROCESS_START` → `PARSE_OPTIONS_START` | FFmpeg library initialization |
-| `PARSE_OPTIONS_START` → `RTSP_CONNECT_START` | Command line parsing |
-| `RTSP_CONNECT_START` → `RTSP_CONNECT_SUCCESS` | Network connection to camera |
-| `RTSP_CONNECT_SUCCESS` → `PARSE_OPTIONS_COMPLETE` | Stream probing, format detection |
-| `PARSE_OPTIONS_COMPLETE` → `TRANSCODE_START` | Encoder/muxer setup |
+| `PARSE_OPTIONS_START` → `INPUT_OPEN_START` | Command line parsing |
+| `INPUT_OPEN_START` → `RTSP_CONNECT_START` | Protocol handler setup |
+| `RTSP_CONNECT_START` → `RTSP_CONNECT_SUCCESS` | TCP connection to camera |
+| `RTSP_CONNECT_SUCCESS` → `INPUT_OPEN_SUCCESS` | RTSP handshake (DESCRIBE, SETUP, PLAY) |
+| `INPUT_OPEN_SUCCESS` → `PROBE_START` | Codec selection setup |
+| `PROBE_START` → `PROBE_COMPLETE` | **Reading packets to detect stream params** |
+| `PROBE_COMPLETE` → `PARSE_OPTIONS_COMPLETE` | Output file setup |
+| `PARSE_OPTIONS_COMPLETE` → `TRANSCODE_START` | Encoder/muxer initialization |
 | `TRANSCODE_START` → `FIRST_PACKET` | First frame processing |
 
 ### Log Size Estimation
