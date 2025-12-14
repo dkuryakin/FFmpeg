@@ -22,6 +22,7 @@
 #include "config_components.h"
 
 #include "libavutil/avstring.h"
+#include "libavutil/events_log.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/mem.h"
@@ -914,9 +915,12 @@ retry:
     ret = ff_rtsp_fetch_packet(s, pkt);
     if (ret < 0) {
         if (ret == AVERROR(ETIMEDOUT) && !rt->packets) {
+            ff_log_event("RTSP_READ_TIMEOUT", "\"timeout_us\":%"PRId64",\"transport\":\"%s\"",
+                         rt->stimeout, rt->lower_transport == RTSP_LOWER_TRANSPORT_UDP ? "udp" : "tcp");
             if (rt->lower_transport == RTSP_LOWER_TRANSPORT_UDP &&
                 rt->lower_transport_mask & (1 << RTSP_LOWER_TRANSPORT_TCP)) {
                 RTSPMessageHeader reply1, *reply = &reply1;
+                ff_log_event("RTSP_RETRY_TCP", NULL);
                 av_log(s, AV_LOG_WARNING, "UDP timeout, retrying with TCP\n");
                 if (rtsp_read_pause(s) != 0)
                     return -1;

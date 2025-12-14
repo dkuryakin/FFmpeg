@@ -387,6 +387,16 @@ Append-only log file for tracking key control events during FFmpeg execution. En
 | `RTSP_DESCRIBE_DONE` | DESCRIBE/SDP parsed | ret |
 | `RTSP_SETUP_START` | Starting SETUP for streams | - |
 | `RTSP_SETUP_DONE` | All streams setup | nb_streams |
+| `RTSP_TIMEOUT` | Socket I/O timeout (low level) | timeout_us |
+| `RTSP_READ_TIMEOUT` | Read packet timeout | timeout_us, transport |
+| `RTSP_RETRY_TCP` | Retrying with TCP after UDP timeout | - |
+
+#### Network events (network.c)
+
+| Event | Description | Fields |
+|-------|-------------|--------|
+| `TCP_CONNECT_TIMEOUT` | TCP connection timed out | timeout_ms_per_address |
+| `TCP_CONNECT_FAILED` | TCP connection failed | error |
 
 #### Scheduler events (ffmpeg_sched.c)
 

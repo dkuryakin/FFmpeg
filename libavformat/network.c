@@ -30,6 +30,7 @@
 #include "tls.h"
 #include "url.h"
 #include "libavutil/avassert.h"
+#include "libavutil/events_log.h"
 #include "libavutil/mem.h"
 #include "libavutil/time.h"
 
@@ -518,6 +519,11 @@ int ff_connect_parallel(struct addrinfo *addrs, int timeout_ms_per_address,
     if (last_err != AVERROR_EXIT) {
         av_log(h, AV_LOG_ERROR, "Connection to %s failed: %s\n",
                h->filename, av_err2str(last_err));
+        if (last_err == AVERROR(ETIMEDOUT)) {
+            ff_log_event("TCP_CONNECT_TIMEOUT", "\"timeout_ms_per_address\":%d", timeout_ms_per_address);
+        } else {
+            ff_log_event("TCP_CONNECT_FAILED", "\"error\":%d", last_err);
+        }
     }
     return last_err;
 }

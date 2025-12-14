@@ -2194,6 +2194,7 @@ static int udp_read_packet(AVFormatContext *s, RTSPStream **prtsp_st,
             }
 #endif
         } else if (n == 0 && rt->stimeout > 0 && --runs <= 0) {
+            ff_log_event("RTSP_TIMEOUT", "\"timeout_us\":%"PRId64, rt->stimeout);
             return AVERROR(ETIMEDOUT);
         } else if (n < 0 && errno != EINTR)
             return AVERROR(errno);
