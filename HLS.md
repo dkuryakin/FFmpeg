@@ -190,6 +190,7 @@ pts=<pts>,is_keyframe=<0|1>,frame_type=<I|P|B>,codec=<src_codec>,encoding=<1|0>,
 ```
 
 Fields:
+- `fps` — calculated from actual frame PTS intervals (30-frame sliding window average), not from stream metadata
 - `codec` — исходный кодек потока (например hevc, h264), **не auto_h264**
 - `encoding` — 1 если идёт перекодирование (source codec != output codec), 0 если stream copy
 - `gop_size` — размер предыдущего завершённого GOP (количество кадров между ключевыми)
@@ -541,7 +542,48 @@ This ensures segment integrity — the last segment contains only valid data wit
 
 ---
 
-## 8. Minimal Example
+## 8. Low-Latency Input Options
+
+**Location:** `libavformat/options_table.h`, `libavcodec/options_table.h`
+
+Default values optimized for minimum startup latency with RTSP streams.
+
+### Changed Defaults
+
+| Option | Original Default | New Default | Description |
+|--------|-----------------|-------------|-------------|
+| `probesize` | 5000000 (5MB) | **32** | Minimal probe buffer for fast start |
+| `analyzeduration` | auto | **0** | Don't wait to analyze stream duration |
+| `fflags` | (auto_bsf) | **nobuffer+auto_bsf** | Don't buffer input packets |
+| `flags` (codec) | (none) | **low_delay** | Enable low-delay mode for codec |
+
+### Override to Original Values
+
+```bash
+# If you need more reliable stream detection:
+ffmpeg -probesize 5000000 -analyzeduration 5000000 -i rtsp://camera/stream ...
+
+# If you need buffering:
+ffmpeg -fflags -nobuffer -i rtsp://camera/stream ...
+```
+
+### Frame Output with Low Probesize
+
+When using `-probesize 32`, video dimensions may be unknown at startup (0x0). The HLS frame output system handles this automatically:
+
+1. **At startup:** Decoder is initialized, but `SwsContext` creation is deferred if dimensions are 0x0
+2. **After first keyframe:** When the first frame is decoded and dimensions become known, `SwsContext` is created lazily
+3. **In logs:** You'll see:
+   ```
+   [hls] Video dimensions unknown at header time (0x0), SwsContext will be created lazily after first frame decode
+   [hls] Creating SwsContext lazily for 1920x1080 format=0
+   ```
+
+This allows frame output to work correctly even with minimal probesize.
+
+---
+
+## 9. Minimal Example
 
 With the new defaults, a minimal RTSP-to-HLS command is simply:
 
@@ -564,13 +606,16 @@ This automatically applies:
 
 ---
 
-## 9. Full Example with All Options
+## 10. Full Example with All Options
 
-Complete example with all custom options explicitly specified:
+Complete example with all custom options explicitly specified (note: low-latency options are now defaults):
 
 ```bash
 # Enable events logging via environment variable
 export FFMPEG_EVENTS_LOG=/var/log/ffmpeg/events.log
+
+# Low-latency options (-probesize 32, -analyzeduration 0, -fflags nobuffer, -flags low_delay)
+# are now defaults and don't need to be specified
 
 ffmpeg \
     -hide_banner -loglevel info \
@@ -605,6 +650,10 @@ ffmpeg \
 | Category | Option | Default | Purpose |
 |----------|--------|---------|---------|
 | **Input** | `rtsp_transport` | **TCP** | RTSP protocol transport |
+| **Low-Latency** | `probesize` | **32** | Minimal probe buffer for fast start |
+| **Low-Latency** | `analyzeduration` | **0** | No analyze wait |
+| **Low-Latency** | `fflags` | **nobuffer** | Disable input buffering |
+| **Low-Latency** | `flags` (codec) | **low_delay** | Low-delay codec mode |
 | **Codec** | `-c:v auto_h264` | - | Auto passthrough/encode for HLS |
 | **Segments** | `hls_time` | **1 sec** | Segment duration |
 | **Segments** | `hls_list_size` | **0** | Playlist size (0=infinite) |

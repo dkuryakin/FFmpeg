@@ -78,6 +78,11 @@ typedef enum {
 #define LINE_BUFFER_SIZE MAX_URL_SIZE
 #define HLS_MICROSECOND_UNIT   1000000
 #define BUFSIZE (16 * 1024)
+
+/* FPS calculation constants */
+#define FPS_HISTORY_SIZE       30      /* sliding window size for FPS averaging */
+#define FPS_MIN_DURATION_SEC   0.001   /* minimum frame duration (1000 fps max) */
+#define FPS_MAX_DURATION_SEC   1.0     /* maximum frame duration (1 fps min) */
 #define POSTFIX_PATTERN "_%d"
 
 typedef struct HLSSegment {
@@ -242,6 +247,15 @@ typedef struct VariantStream {
     /* GOP tracking */
     int     gop_counter;            /* frames counted in current GOP */
     int     last_gop_size;          /* size of last completed GOP */
+
+    /* FPS calculation from actual frame intervals */
+    int64_t fps_prev_pts;           /* PTS of previous frame for FPS calculation */
+    int     fps_prev_pts_valid;     /* flag indicating fps_prev_pts is valid */
+    double  fps_sum;                /* sum of instantaneous FPS values in window */
+    double  fps_history[FPS_HISTORY_SIZE]; /* circular buffer of FPS values */
+    int     fps_history_index;      /* current index in circular buffer */
+    int     fps_history_count;      /* number of valid entries */
+    double  fps_calculated;         /* current calculated FPS (averaged) */
 
     /* Input stream info for metadata */
     char    input_codec_name[32];   /* codec name of input stream (e.g. "hevc", "h264") */
@@ -2551,10 +2565,32 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
     av_log(s, AV_LOG_DEBUG, "Frame decoded successfully: %dx%d, format=%d\n",
            frame->width, frame->height, frame->format);
 
-    /* Convert to BGR */
+    /* Convert to BGR - create SwsContext lazily if not yet initialized
+     * (this happens when video dimensions were unknown at header time due to low probesize) */
     if (!vs->sws_ctx) {
-        av_log(s, AV_LOG_WARNING, "SwsContext not initialized\n");
-        return 0;
+        enum AVPixelFormat pix_fmt = frame->format;
+        
+        if (frame->width <= 0 || frame->height <= 0) {
+            av_log(s, AV_LOG_WARNING, "Cannot create SwsContext: invalid frame dimensions %dx%d\n",
+                   frame->width, frame->height);
+            return 0;
+        }
+        
+        if (pix_fmt == AV_PIX_FMT_NONE) {
+            pix_fmt = AV_PIX_FMT_YUV420P; /* default fallback */
+        }
+        
+        av_log(s, AV_LOG_INFO, "Creating SwsContext lazily for %dx%d format=%d\n",
+               frame->width, frame->height, pix_fmt);
+        
+        vs->sws_ctx = sws_getContext(frame->width, frame->height, pix_fmt,
+                                     frame->width, frame->height, AV_PIX_FMT_BGR24,
+                                     SWS_FAST_BILINEAR, NULL, NULL, NULL);
+        if (!vs->sws_ctx) {
+            av_log(s, AV_LOG_WARNING, "Could not create SwsContext for %dx%d format=%d\n",
+                   frame->width, frame->height, pix_fmt);
+            return 0;
+        }
     }
 
     bgr_size = av_image_get_buffer_size(AV_PIX_FMT_BGR24, frame->width, frame->height, 1);
@@ -2638,10 +2674,44 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
                base_pdt, time_offset, program_date_time_sec);
     }
 
-    /* Calculate additional metadata */
+    /* Calculate FPS from actual frame PTS intervals (sliding window average) */
     double fps = 0.0;
-    if (st->avg_frame_rate.num && st->avg_frame_rate.den) {
-        fps = av_q2d(st->avg_frame_rate);
+    {
+        int64_t current_pts = pkt->pts;
+        if (current_pts != AV_NOPTS_VALUE && vs->fps_prev_pts_valid && 
+            vs->fps_prev_pts != AV_NOPTS_VALUE && time_base.den > 0) {
+            int64_t pts_diff = current_pts - vs->fps_prev_pts;
+            if (pts_diff > 0) {
+                double duration_sec = (double)pts_diff * time_base.num / time_base.den;
+                if (duration_sec > FPS_MIN_DURATION_SEC && duration_sec < FPS_MAX_DURATION_SEC) {
+                    double instant_fps = 1.0 / duration_sec;
+                    
+                    /* Sliding window average with sum optimization */
+                    int window_size = FPS_HISTORY_SIZE;
+                    if (vs->fps_history_count < window_size) {
+                        /* Window not full yet - just add */
+                        vs->fps_history[vs->fps_history_index] = instant_fps;
+                        vs->fps_sum += instant_fps;
+                        vs->fps_history_count++;
+                    } else {
+                        /* Window full - subtract old, add new */
+                        vs->fps_sum -= vs->fps_history[vs->fps_history_index];
+                        vs->fps_history[vs->fps_history_index] = instant_fps;
+                        vs->fps_sum += instant_fps;
+                    }
+                    vs->fps_history_index = (vs->fps_history_index + 1) % window_size;
+                    vs->fps_calculated = vs->fps_sum / vs->fps_history_count;
+                }
+            }
+        }
+        vs->fps_prev_pts = current_pts;
+        vs->fps_prev_pts_valid = 1;
+        fps = vs->fps_calculated;
+        
+        /* Fallback to stream metadata if we don't have enough samples yet */
+        if (fps <= 0.0 && st->avg_frame_rate.num && st->avg_frame_rate.den) {
+            fps = av_q2d(st->avg_frame_rate);
+        }
     }
 
     /* Keyframe flag - needed early for GOP tracking */
@@ -3011,15 +3081,25 @@ static int hls_write_header(AVFormatContext *s)
                     }
                 }
 
-                /* Use fast bilinear for better performance - quality is acceptable for frame output */
-                sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, pix_fmt,
-                                        dec_ctx->width, dec_ctx->height, AV_PIX_FMT_BGR24,
-                                        SWS_FAST_BILINEAR, NULL, NULL, NULL);
-                if (!sws_ctx) {
-                    av_log(s, AV_LOG_WARNING, "Could not create SwsContext\n");
-                    av_frame_free(&frame);
-                    avcodec_free_context(&dec_ctx);
-                    continue;
+                /* Create SwsContext only if dimensions are known.
+                 * With low probesize, dimensions may be 0x0 at header time.
+                 * In that case, SwsContext will be created lazily in write_frame_raw()
+                 * after the first frame is decoded and dimensions become known. */
+                if (dec_ctx->width > 0 && dec_ctx->height > 0) {
+                    /* Use fast bilinear for better performance - quality is acceptable for frame output */
+                    sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, pix_fmt,
+                                            dec_ctx->width, dec_ctx->height, AV_PIX_FMT_BGR24,
+                                            SWS_FAST_BILINEAR, NULL, NULL, NULL);
+                    if (!sws_ctx) {
+                        av_log(s, AV_LOG_WARNING, "Could not create SwsContext\n");
+                        av_frame_free(&frame);
+                        avcodec_free_context(&dec_ctx);
+                        continue;
+                    }
+                } else {
+                    av_log(s, AV_LOG_INFO, "Video dimensions unknown at header time (0x0), "
+                           "SwsContext will be created lazily after first frame decode\n");
+                    sws_ctx = NULL;
                 }
 
                 vs->decoder_ctx = dec_ctx;
@@ -3041,6 +3121,14 @@ static int hls_write_header(AVFormatContext *s)
                 vs->drift_baseline_wallclock = 0.0;
                 vs->drift_baseline_pts_sec = 0.0;
                 vs->drift_baseline_valid = 0;
+
+                /* Initialize FPS calculation */
+                vs->fps_prev_pts = AV_NOPTS_VALUE;
+                vs->fps_prev_pts_valid = 0;
+                vs->fps_sum = 0.0;
+                vs->fps_history_index = 0;
+                vs->fps_history_count = 0;
+                vs->fps_calculated = 0.0;
                 vs->drift_time_base = inner_st->time_base;
 
                 /* Initialize multiple drift windows */
