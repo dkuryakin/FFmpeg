@@ -174,8 +174,26 @@ Real-time frame extraction during HLS encoding for external processing (e.g., AI
 | `hls_frame_buffer_interval` | string | "1" | Buffer output interval: frames (e.g. "1") or seconds (e.g. "0.5s") |
 | `hls_frame_buffer_size` | int | 0 | How many last frames to keep in buffer (0 = unlimited) |
 | `hls_fps_window` | string | "30" | FPS calculation window: frames (e.g. "30") or seconds (e.g. "1.0s") |
+| `hls_keyframes_only` | bool | 0 | **Super-economical mode:** decode only keyframes (I-frames) |
 
 **Note:** All intervals with suffix `s` use server wall clock time, not media time.
+
+### Keyframes-Only Mode (`hls_keyframes_only=1`)
+
+Super-economical mode that decodes only keyframes (I-frames), completely skipping P and B frames.
+
+**Benefits:**
+- **Drastically reduced CPU usage** — decodes ~1 frame per GOP instead of all frames
+- **Lower latency** — no need to wait for frame dependencies
+- **Same FPS and GOP size in metadata** — calculated from packet data, not decoded frames
+
+**Behavior:**
+- All interval options (`hls_frame_interval`, `hls_frame_buffer_interval`, etc.) are **ignored**
+- Every keyframe is automatically output
+- FPS and GOP size are still calculated correctly from packet PTS
+- Drift detection works (with lower sample rate)
+
+**Use case:** When you only need periodic snapshots (e.g., thumbnail generation) and don't need every frame.
 
 ### Frame Output Format
 
@@ -228,6 +246,17 @@ ffmpeg -rtsp_transport tcp -i rtsp://camera/stream \
     -f hls \
     -hls_frame_output /tmp/current_frame.raw \
     -hls_frame_interval 2.5s \
+    -hls_frame_meta_output /tmp/frames.log \
+    playlist.m3u8
+```
+
+**Keyframes-only mode (super-economical, ~1 frame per GOP):**
+```bash
+ffmpeg -rtsp_transport tcp -i rtsp://camera/stream \
+    -c:v auto_h264 \
+    -f hls \
+    -hls_keyframes_only 1 \
+    -hls_frame_output /tmp/current_frame.raw \
     -hls_frame_meta_output /tmp/frames.log \
     playlist.m3u8
 ```
@@ -700,6 +729,7 @@ ffmpeg \
 | **Frame Output** | `hls_frame_buffer_interval` | "1" | Buffer output interval (frames or seconds) |
 | **Frame Output** | `hls_frame_meta_output` | NULL | Frame metadata logging |
 | **Frame Output** | `hls_fps_window` | "30" | FPS calculation window (frames or seconds) |
+| **Frame Output** | `hls_keyframes_only` | 0 | Super-economical mode (keyframes only) |
 | **Monitoring** | `hls_pts_discontinuity_exit` | **1** | Exit on stream issues |
 | **Monitoring** | `hls_pts_discontinuity_threshold_neg` | **0.1** | Backward jump threshold |
 | **Monitoring** | `hls_pts_discontinuity_threshold_pos` | **1.0** | Forward jump threshold |

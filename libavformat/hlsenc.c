@@ -429,6 +429,9 @@ typedef struct HLSContext {
 
     /* Graceful exit flag - when set, current segment is finished before exiting */
     int     graceful_exit_requested;  /* 1 if graceful exit is pending */
+
+    /* Keyframes-only mode - process only keyframes, skip decoding of non-keyframes */
+    int     keyframes_only;           /* 1 if only keyframes should be decoded */
 } HLSContext;
 
 static av_always_inline int hls_has_frame_outputs(const HLSContext *hls)
@@ -2627,6 +2630,84 @@ fail:
     return ret;
 }
 
+/**
+ * Update FPS and GOP statistics from packet data (before decoding).
+ * This allows tracking even when not decoding frames (keyframes_only mode).
+ */
+static void update_packet_stats(AVFormatContext *s, HLSContext *hls, VariantStream *vs,
+                                AVPacket *pkt, AVStream *st, double wallclock_now)
+{
+    AVRational time_base = st->time_base;
+    int is_keyframe = (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
+
+    /* Update FPS calculation from packet PTS intervals */
+    {
+        int64_t current_pts = pkt->pts;
+        
+        if (current_pts != AV_NOPTS_VALUE && vs->fps_prev_pts_valid && 
+            vs->fps_prev_pts != AV_NOPTS_VALUE && time_base.den > 0) {
+            int64_t pts_diff = current_pts - vs->fps_prev_pts;
+            if (pts_diff > 0) {
+                double duration_sec = (double)pts_diff * time_base.num / time_base.den;
+                if (duration_sec > FPS_MIN_DURATION_SEC && duration_sec < FPS_MAX_DURATION_SEC) {
+                    double instant_fps = 1.0 / duration_sec;
+                    int capacity = vs->fps_history_capacity;
+                    
+                    if (hls->fps_window_mode == 0) {
+                        /* Frame-based: sliding window average with sum optimization */
+                        int window_size = hls->fps_window_frames;
+                        if (vs->fps_history && capacity > 0) {
+                            if (vs->fps_history_count < window_size) {
+                                /* Window not full yet - just add */
+                                vs->fps_history[vs->fps_history_index] = instant_fps;
+                                vs->fps_sum += instant_fps;
+                                vs->fps_history_count++;
+                            } else {
+                                /* Window full - subtract old, add new */
+                                vs->fps_sum -= vs->fps_history[vs->fps_history_index];
+                                vs->fps_history[vs->fps_history_index] = instant_fps;
+                                vs->fps_sum += instant_fps;
+                            }
+                            vs->fps_history_index = (vs->fps_history_index + 1) % window_size;
+                            vs->fps_calculated = vs->fps_sum / vs->fps_history_count;
+                        }
+                    } else {
+                        /* Time-based: binned sliding sum - O(1) add, O(1) average */
+                        /* Initialize on first sample */
+                        if (vs->fps_head_bin_start <= 0.0) {
+                            vs->fps_head_bin_start = wallclock_now;
+                        }
+                        
+                        binned_window_add(vs->fps_bin_sums,
+                                          vs->fps_bin_counts,
+                                          &vs->fps_head_bin,
+                                          vs->fps_bin_duration,
+                                          &vs->fps_head_bin_start,
+                                          &vs->fps_running_sum,
+                                          &vs->fps_running_count,
+                                          instant_fps, wallclock_now);
+                        
+                        vs->fps_calculated = binned_window_average(
+                            vs->fps_running_sum,
+                            vs->fps_running_count);
+                    }
+                }
+            }
+        }
+        vs->fps_prev_pts = current_pts;
+        vs->fps_prev_pts_valid = 1;
+    }
+
+    /* Update GOP tracking */
+    if (is_keyframe) {
+        if (vs->gop_counter > 0)
+            vs->last_gop_size = vs->gop_counter;
+        vs->gop_counter = 1; /* count this keyframe */
+    } else {
+        vs->gop_counter++;
+    }
+}
+
 static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *vs,
                            AVPacket *pkt, AVStream *st)
 {
@@ -2791,72 +2872,14 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
                base_pdt, time_offset, program_date_time_sec);
     }
 
-    /* Calculate FPS from actual frame PTS intervals (sliding window average) */
-    double fps = 0.0;
-    {
-        int64_t current_pts = pkt->pts;
-        
-        if (current_pts != AV_NOPTS_VALUE && vs->fps_prev_pts_valid && 
-            vs->fps_prev_pts != AV_NOPTS_VALUE && time_base.den > 0) {
-            int64_t pts_diff = current_pts - vs->fps_prev_pts;
-            if (pts_diff > 0) {
-                double duration_sec = (double)pts_diff * time_base.num / time_base.den;
-                if (duration_sec > FPS_MIN_DURATION_SEC && duration_sec < FPS_MAX_DURATION_SEC) {
-                    double instant_fps = 1.0 / duration_sec;
-                    int capacity = vs->fps_history_capacity;
-                    
-                    if (hls->fps_window_mode == 0) {
-                        /* Frame-based: sliding window average with sum optimization */
-                        int window_size = hls->fps_window_frames;
-                        if (vs->fps_history && capacity > 0) {
-                            if (vs->fps_history_count < window_size) {
-                                /* Window not full yet - just add */
-                                vs->fps_history[vs->fps_history_index] = instant_fps;
-                                vs->fps_sum += instant_fps;
-                                vs->fps_history_count++;
-                            } else {
-                                /* Window full - subtract old, add new */
-                                vs->fps_sum -= vs->fps_history[vs->fps_history_index];
-                                vs->fps_history[vs->fps_history_index] = instant_fps;
-                                vs->fps_sum += instant_fps;
-                            }
-                            vs->fps_history_index = (vs->fps_history_index + 1) % window_size;
-                            vs->fps_calculated = vs->fps_sum / vs->fps_history_count;
-                        }
-                    } else {
-                        /* Time-based: binned sliding sum - O(1) add, O(1) average */
-                        /* Initialize on first sample */
-                        if (vs->fps_head_bin_start <= 0.0) {
-                            vs->fps_head_bin_start = wallclock_now;
-                        }
-                        
-                        binned_window_add(vs->fps_bin_sums,
-                                          vs->fps_bin_counts,
-                                          &vs->fps_head_bin,
-                                          vs->fps_bin_duration,
-                                          &vs->fps_head_bin_start,
-                                          &vs->fps_running_sum,
-                                          &vs->fps_running_count,
-                                          instant_fps, wallclock_now);
-                        
-                        vs->fps_calculated = binned_window_average(
-                            vs->fps_running_sum,
-                            vs->fps_running_count);
-                    }
-                }
-            }
-        }
-        vs->fps_prev_pts = current_pts;
-        vs->fps_prev_pts_valid = 1;
-        fps = vs->fps_calculated;
-        
-        /* Fallback to stream metadata if we don't have enough samples yet */
-        if (fps <= 0.0 && st->avg_frame_rate.num && st->avg_frame_rate.den) {
-            fps = av_q2d(st->avg_frame_rate);
-        }
+    /* Use FPS already calculated by update_packet_stats() */
+    double fps = vs->fps_calculated;
+    /* Fallback to stream metadata if we don't have enough samples yet */
+    if (fps <= 0.0 && st->avg_frame_rate.num && st->avg_frame_rate.den) {
+        fps = av_q2d(st->avg_frame_rate);
     }
 
-    /* Keyframe flag - needed early for GOP tracking */
+    /* Keyframe flag */
     int is_keyframe = (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
 
     /* Build drift string with all window values */
@@ -2880,15 +2903,8 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
         }
     }
 
-    /* GOP tracking: use last completed GOP size for metadata, update counters */
+    /* Use GOP size already calculated by update_packet_stats() */
     int gop_size_meta = vs->last_gop_size;
-    if (is_keyframe) {
-        if (vs->gop_counter > 0)
-            vs->last_gop_size = vs->gop_counter;
-        vs->gop_counter = 1; /* count this keyframe */
-    } else {
-        vs->gop_counter++;
-    }
 
     /* Source codec and encode/copy flag - use stored values from input stream */
     const char *src_codec_name = vs->input_codec_name[0] ? vs->input_codec_name : avcodec_get_name(st->codecpar->codec_id);
@@ -3817,8 +3833,8 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
     }
 
     /* Determine whether this packet should produce a decoded frame for auxiliary outputs.
-     * We still send every packet to the decoder, but only attempt to drain a frame when
-     * the configured intervals request it. */
+     * In normal mode, we send every packet to the decoder but only drain frames at intervals.
+     * In keyframes_only mode, we only send and decode keyframes (I-frames). */
     int need_frame_sample = 0;
     if (hls_has_frame_outputs(hls) &&
         st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && vs && oc) {
@@ -3826,67 +3842,91 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
             /* Decoder not initialized yet - this should not happen, but log it */
             av_log(s, AV_LOG_DEBUG, "Decoder not initialized for stream %d\n", pkt->stream_index);
         } else {
-            vs->frame_counter++;
-
-            /* Always send packets to decoder (it needs all of them) */
-            int ret = avcodec_send_packet(vs->decoder_ctx, pkt);
-            if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
-                av_log(s, AV_LOG_WARNING, "Error sending packet to decoder: %s\n", av_err2str(ret));
-            }
-
-            /* Only try to get frame for every Nth packet according to either
-             * single-frame output interval, buffer output interval, or unconditionally
-             * if frame metadata logging is enabled. */
+            int is_keyframe = (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
             
-            /* Cache wallclock for time-based interval checks (avoid multiple syscalls) */
+            /* Lazy wallclock: only call av_gettime() if needed for time-based operations */
             double wallclock_now_pkt = 0.0;
-            if ((hls->frame_output_path && hls->frame_output_interval_mode == 1) ||
-                (hls->frame_buffer_output && hls->frame_buffer_interval_mode == 1)) {
+            int need_wallclock = (hls->fps_window_mode == 1) ||
+                                 (!hls->keyframes_only && (
+                                     (hls->frame_output_path && hls->frame_output_interval_mode == 1) ||
+                                     (hls->frame_buffer_output && hls->frame_buffer_interval_mode == 1)));
+            if (need_wallclock) {
                 wallclock_now_pkt = av_gettime() / 1000000.0;
             }
             
-            int sample_single = 0;
-            if (hls->frame_output_path) {
-                if (hls->frame_output_interval_mode == 0) {
-                    /* Frame-based interval */
-                    sample_single = (vs->frame_counter % hls->frame_output_interval_frames == 0);
-                } else {
-                    /* Time-based interval (seconds) */
-                    if (vs->last_frame_output_wallclock <= 0.0) {
-                        /* First frame - always output */
-                        sample_single = 1;
-                    } else {
-                        double elapsed = wallclock_now_pkt - vs->last_frame_output_wallclock;
-                        if (elapsed >= hls->frame_output_interval_seconds) {
-                            sample_single = 1;
-                        }
-                    }
-                }
-            }
-            int sample_buffer = 0;
-            if (hls->frame_buffer_output) {
-                if (hls->frame_buffer_interval_mode == 0) {
-                    sample_buffer = (hls->frame_buffer_interval_frames > 0 &&
-                                     vs->frame_counter % hls->frame_buffer_interval_frames == 0);
-                } else {
-                    /* Time-based interval (seconds) */
-                    if (vs->last_frame_buffer_wallclock <= 0.0) {
-                        sample_buffer = 1;
-                    } else {
-                        double elapsed = wallclock_now_pkt - vs->last_frame_buffer_wallclock;
-                        if (elapsed >= hls->frame_buffer_interval_seconds) {
-                            sample_buffer = 1;
-                        }
-                    }
-                }
-            }
-            int sample_meta = !!hls->frame_meta_output_path;
+            /* Update FPS and GOP statistics from packet data (works in all modes) */
+            update_packet_stats(s, hls, vs, pkt, st, wallclock_now_pkt);
+            
+            vs->frame_counter++;
 
-            if (sample_single || sample_buffer || sample_meta) {
-                av_log(s, AV_LOG_DEBUG,
-                       "Trying to get frame %d (need decode for output)\n",
-                       vs->frame_counter);
-                need_frame_sample = 1;
+            if (hls->keyframes_only) {
+                /* Keyframes-only mode: only decode keyframes, skip all others */
+                if (is_keyframe) {
+                    int ret = avcodec_send_packet(vs->decoder_ctx, pkt);
+                    if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
+                        av_log(s, AV_LOG_WARNING, "Error sending keyframe to decoder: %s\n", av_err2str(ret));
+                    }
+                    /* Always output every keyframe (intervals are ignored) */
+                    need_frame_sample = 1;
+                    av_log(s, AV_LOG_DEBUG,
+                           "Keyframes-only mode: decoding keyframe %d\n",
+                           vs->frame_counter);
+                }
+                /* Non-keyframes are completely skipped - no send_packet, no decode */
+            } else {
+                /* Normal mode: send all packets to decoder (it needs all of them) */
+                int ret = avcodec_send_packet(vs->decoder_ctx, pkt);
+                if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
+                    av_log(s, AV_LOG_WARNING, "Error sending packet to decoder: %s\n", av_err2str(ret));
+                }
+
+                /* Only try to get frame for every Nth packet according to either
+                 * single-frame output interval, buffer output interval, or unconditionally
+                 * if frame metadata logging is enabled. */
+                
+                int sample_single = 0;
+                if (hls->frame_output_path) {
+                    if (hls->frame_output_interval_mode == 0) {
+                        /* Frame-based interval */
+                        sample_single = (vs->frame_counter % hls->frame_output_interval_frames == 0);
+                    } else {
+                        /* Time-based interval (seconds) */
+                        if (vs->last_frame_output_wallclock <= 0.0) {
+                            /* First frame - always output */
+                            sample_single = 1;
+                        } else {
+                            double elapsed = wallclock_now_pkt - vs->last_frame_output_wallclock;
+                            if (elapsed >= hls->frame_output_interval_seconds) {
+                                sample_single = 1;
+                            }
+                        }
+                    }
+                }
+                int sample_buffer = 0;
+                if (hls->frame_buffer_output) {
+                    if (hls->frame_buffer_interval_mode == 0) {
+                        sample_buffer = (hls->frame_buffer_interval_frames > 0 &&
+                                         vs->frame_counter % hls->frame_buffer_interval_frames == 0);
+                    } else {
+                        /* Time-based interval (seconds) */
+                        if (vs->last_frame_buffer_wallclock <= 0.0) {
+                            sample_buffer = 1;
+                        } else {
+                            double elapsed = wallclock_now_pkt - vs->last_frame_buffer_wallclock;
+                            if (elapsed >= hls->frame_buffer_interval_seconds) {
+                                sample_buffer = 1;
+                            }
+                        }
+                    }
+                }
+                int sample_meta = !!hls->frame_meta_output_path;
+
+                if (sample_single || sample_buffer || sample_meta) {
+                    av_log(s, AV_LOG_DEBUG,
+                           "Trying to get frame %d (need decode for output)\n",
+                           vs->frame_counter);
+                    need_frame_sample = 1;
+                }
             }
         }
     }
@@ -4961,6 +5001,7 @@ static const AVOption options[] = {
     {"hls_drift_window", "drift windows (comma-sep): frames (e.g. \"1,30,300\") or seconds (e.g. \"0.04s,1s,10s\")", OFFSET(drift_window_str), AV_OPT_TYPE_STRING, {.str = "1,30,300,900"}, 0, 0, E},
     {"hls_drift_min_threshold", "min drift thresholds per window (e.g. \"300:-2\" for frames, \"10s:-2\" for seconds)", OFFSET(drift_min_threshold_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     {"hls_drift_max_threshold", "max drift thresholds per window (e.g. \"30:2\" for frames, \"10s:2\" for seconds)", OFFSET(drift_max_threshold_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
+    {"hls_keyframes_only", "process only keyframes, skip decoding of non-keyframes (super-economical mode)", OFFSET(keyframes_only), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, E},
     /* Internal options for auto_h264 - set programmatically, not exposed in help */
     {"hls_input_codec", "input codec name (internal, set by auto_h264)", OFFSET(input_codec_name), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     {"hls_auto_h264_encode", "encoding mode flag (internal, set by auto_h264)", OFFSET(auto_h264_encode), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, E},
