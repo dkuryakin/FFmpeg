@@ -89,8 +89,9 @@ Optimized defaults for RTSP-to-HLS live streaming.
 | `hls_pts_discontinuity_exit` | 0 | **1** | Exit on stream issues |
 | `hls_pts_discontinuity_threshold_neg` | 0 | **0.1** | 100ms backward jump threshold |
 | `hls_pts_discontinuity_threshold_pos` | 1 | **1.0** | 1 sec forward jump threshold |
-| `hls_drift_startup_window` | 1 | **30** | 30 frames for baseline selection |
-| `hls_drift_window` | "1" | **"1,30,300,900"** | Multiple averaging windows |
+| `hls_drift_startup_window` | "1" | **"30"** | 30 frames for baseline selection (or use "1.0s" for seconds) |
+| `hls_drift_window` | "1" | **"1,30,300,900"** | Multiple averaging windows (frames or seconds, e.g. "1,30,10s,30s") |
+| `hls_fps_window` | "1" | **"30"** | FPS calculation window (frames or seconds, e.g. "1.0s") |
 
 ### Default hls_flags Explained
 
@@ -166,12 +167,15 @@ Real-time frame extraction during HLS encoding for external processing (e.g., AI
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `hls_frame_output` | string | NULL | Path to write current frame as BGR raw data |
-| `hls_frame_interval` | int | 1 | Write every Nth frame |
+| `hls_frame_interval` | string | "1" | Frame output interval: frames (e.g. "25") or seconds (e.g. "2.5s") |
 | `hls_frame_meta_output` | string | NULL | Path to write frame metadata (append mode) |
-| `hls_frame_meta_interval` | int | 1 | Write metadata every Nth frame |
+| `hls_frame_meta_interval` | string | "1" | Meta output interval: frames (e.g. "1") or seconds (e.g. "0.5s") |
 | `hls_frame_buffer_output` | string | NULL | Template for numbered frame files (e.g., `/path/frame_%09d.raw`) |
-| `hls_frame_buffer_interval` | int | 1 | Write every Nth frame into frame buffer |
+| `hls_frame_buffer_interval` | string | "1" | Buffer output interval: frames (e.g. "1") or seconds (e.g. "0.5s") |
 | `hls_frame_buffer_size` | int | 0 | How many last frames to keep in buffer (0 = unlimited) |
+| `hls_fps_window` | string | "30" | FPS calculation window: frames (e.g. "30") or seconds (e.g. "1.0s") |
+
+**Note:** All intervals with suffix `s` use server wall clock time, not media time.
 
 ### Frame Output Format
 
@@ -190,7 +194,7 @@ pts=<pts>,is_keyframe=<0|1>,frame_type=<I|P|B>,codec=<src_codec>,encoding=<1|0>,
 ```
 
 Fields:
-- `fps` — calculated from actual frame PTS intervals (30-frame sliding window average), not from stream metadata
+- `fps` — calculated from actual frame PTS intervals (configurable window via `hls_fps_window`), not from stream metadata
 - `codec` — исходный кодек потока (например hevc, h264), **не auto_h264**
 - `encoding` — 1 если идёт перекодирование (source codec != output codec), 0 если stream copy
 - `gop_size` — размер предыдущего завершённого GOP (количество кадров между ключевыми)
@@ -204,6 +208,7 @@ codec=hevc,encoding=1,gop_size=24,drift1=0.001234,drift30=0.002345,drift300=0.00
 
 ### Usage Example
 
+**Frame-based interval (every Nth frame):**
 ```bash
 ffmpeg -rtsp_transport tcp -i rtsp://camera/stream \
     -c:v auto_h264 \
@@ -213,6 +218,17 @@ ffmpeg -rtsp_transport tcp -i rtsp://camera/stream \
     -hls_frame_meta_output /tmp/frames.log \
     -hls_frame_buffer_output /tmp/frames/frame_%09d.raw \
     -hls_frame_buffer_size 100 \
+    playlist.m3u8
+```
+
+**Time-based interval (every N seconds, server wall clock time):**
+```bash
+ffmpeg -rtsp_transport tcp -i rtsp://camera/stream \
+    -c:v auto_h264 \
+    -f hls \
+    -hls_frame_output /tmp/current_frame.raw \
+    -hls_frame_interval 2.5s \
+    -hls_frame_meta_output /tmp/frames.log \
     playlist.m3u8
 ```
 
@@ -264,29 +280,36 @@ Calculates drift between PTS timestamps and wall-clock time for stream health mo
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `hls_drift_startup_window` | int | **30** | Number of frames for baseline selection |
-| `hls_drift_window` | string | **"1,30,300,900"** | Comma-separated list of averaging window sizes |
-| `hls_drift_min_threshold` | string | NULL | Min drift thresholds per window (e.g. `"300:-2,900:-5"`) |
-| `hls_drift_max_threshold` | string | NULL | Max drift thresholds per window (e.g. `"30:2,300:5"`) |
+| `hls_drift_startup_window` | string | **"30"** | Startup window: frames (e.g. "30") or seconds (e.g. "1.0s") |
+| `hls_drift_window` | string | **"1,30,300,900"** | Comma-separated list of window sizes: frames or seconds (e.g. "1,30,10s,30s") |
+| `hls_drift_min_threshold` | string | NULL | Min drift thresholds per window (e.g. `"300:-2"` or `"10s:-2"`) |
+| `hls_drift_max_threshold` | string | NULL | Max drift thresholds per window (e.g. `"30:2"` or `"10s:2"`) |
+
+**Note:** All intervals with suffix `s` use server wall clock time, not media time.
 
 ### How Drift Works
 
-1. **Startup phase:** First N frames are analyzed to find the best baseline:
+1. **Startup phase:** First N frames (or N seconds) are analyzed to find the best baseline:
    - First frame is used as temporary baseline (drift = 0)
    - For each subsequent frame, drift relative to first frame is calculated
    - The frame with **minimum drift** (closest to real-time, even if negative) becomes the final baseline
    - This selects the frame that arrived with least network/processing lag
 2. **Running phase:** Drift is calculated as difference between expected and actual timestamps
-3. **Multiple windows:** Drift is calculated with sliding sum for each window size (O(1) per frame)
+3. **Multiple windows:** Drift is calculated with sliding sum for each window size (O(1) per frame for frame-based windows)
 
 ### Multiple Drift Windows
 
 The `hls_drift_window` option accepts a comma-separated list of window sizes:
-- **Short windows (1-30):** Detect sudden changes quickly
-- **Medium windows (300):** ~10-12 seconds of averaging at 25fps
-- **Long windows (900):** ~30+ seconds for long-term trend detection
+- **Frame-based (e.g. "30"):** Short windows (1-30 frames) detect sudden changes quickly
+- **Time-based (e.g. "10s"):** Better for varying FPS streams, uses server wall clock time
 
-Each window uses efficient sliding sum calculation, suitable for large window sizes.
+Examples:
+- `"1,30,300,900"` — 1, 30, 300, 900 frames
+- `"0.04s,1s,10s,30s"` — approximately same as above at 25fps, but independent of actual FPS
+
+Each window uses efficient O(1) calculation per frame:
+- **Frame-based:** Sliding sum with circular buffer
+- **Time-based:** Binned sliding sum (100 bins per window, no memory limit, no rounding error)
 
 ### Drift Value in Metadata
 
@@ -306,32 +329,44 @@ The `hls_drift_min_threshold` and `hls_drift_max_threshold` options allow settin
 - **Graceful exit:** Current segment is properly finished and written to playlist
 - FFmpeg exits with error code after segment finalization
 
-**Format:** `"window_size:threshold,window_size:threshold,..."`
+**Format:** `"window:threshold,window:threshold,..."`
+
+Supports both frame-based and time-based windows:
+- Frame-based: `"300:-2"` (window of 300 frames, threshold -2 seconds)
+- Time-based: `"10s:-2"` (window of 10 seconds, threshold -2 seconds)
 
 - **Min threshold:** Exit if drift < threshold (stream running too fast)
 - **Max threshold:** Exit if drift > threshold (stream running too slow)
 
 ```bash
-# Exit if drift300 < -2 sec (stream running 2+ seconds ahead)
-ffmpeg ... -hls_drift_min_threshold "300:-2" ...
+# Frame-based thresholds
+ffmpeg ... -hls_drift_min_threshold "300:-2" ...      # Exit if drift300 < -2 sec
+ffmpeg ... -hls_drift_max_threshold "30:2" ...        # Exit if drift30 > 2 sec
 
-# Exit if drift30 > 2 sec (stream running 2+ seconds behind)
-ffmpeg ... -hls_drift_max_threshold "30:2" ...
+# Time-based thresholds
+ffmpeg ... -hls_drift_min_threshold "10s:-2" ...      # Exit if drift10s < -2 sec
+ffmpeg ... -hls_drift_max_threshold "30s:5" ...       # Exit if drift30s > 5 sec
 
-# Multiple thresholds for different windows
+# Multiple thresholds (can mix frame-based and time-based)
 ffmpeg ... \
-    -hls_drift_min_threshold "300:-2,900:-5" \
-    -hls_drift_max_threshold "30:2,300:5" ...
+    -hls_drift_min_threshold "300:-2,10s:-3" \
+    -hls_drift_max_threshold "30:2,30s:5" ...
 ```
 
 ### Custom Windows Example
 
 ```bash
-# Use only short-term drift detection
+# Use only short-term drift detection (frame-based)
 ffmpeg ... -hls_drift_window "1,10,30" ...
 
-# Use longer windows for stable connections
+# Use longer windows for stable connections (frame-based)
 ffmpeg ... -hls_drift_window "30,60,300,900,1800" ...
+
+# Use time-based windows (FPS-independent)
+ffmpeg ... -hls_drift_window "0.1s,1s,10s,30s" ...
+
+# Mix frame-based and time-based
+ffmpeg ... -hls_drift_window "1,30,10s,30s" ...
 ```
 
 ---
@@ -659,13 +694,17 @@ ffmpeg \
 | **Segments** | `hls_list_size` | **0** | Playlist size (0=infinite) |
 | **Flags** | `hls_flags` | **append+omit+pdt** | Live streaming flags |
 | **Frame Output** | `hls_frame_output` | NULL | Current frame extraction |
+| **Frame Output** | `hls_frame_interval` | "1" | Frame output interval (frames or seconds) |
+| **Frame Output** | `hls_frame_meta_interval` | "1" | Meta output interval (frames or seconds) |
 | **Frame Output** | `hls_frame_buffer_output` | NULL | Circular frame buffer |
+| **Frame Output** | `hls_frame_buffer_interval` | "1" | Buffer output interval (frames or seconds) |
 | **Frame Output** | `hls_frame_meta_output` | NULL | Frame metadata logging |
+| **Frame Output** | `hls_fps_window` | "30" | FPS calculation window (frames or seconds) |
 | **Monitoring** | `hls_pts_discontinuity_exit` | **1** | Exit on stream issues |
 | **Monitoring** | `hls_pts_discontinuity_threshold_neg` | **0.1** | Backward jump threshold |
 | **Monitoring** | `hls_pts_discontinuity_threshold_pos` | **1.0** | Forward jump threshold |
-| **Monitoring** | `hls_drift_startup_window` | **30** | Baseline selection frames |
-| **Monitoring** | `hls_drift_window` | **"1,30,300,900"** | Multiple averaging windows |
+| **Monitoring** | `hls_drift_startup_window` | "30" | Startup window (frames or seconds) |
+| **Monitoring** | `hls_drift_window` | "1,30,300,900" | Averaging windows (frames or seconds) |
 | **Monitoring** | `hls_drift_min_threshold` | NULL | Min drift thresholds per window |
 | **Monitoring** | `hls_drift_max_threshold` | NULL | Max drift thresholds per window |
 | **Logging** | `FFMPEG_EVENTS_LOG` (env) | - | Events log file path |

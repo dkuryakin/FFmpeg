@@ -80,7 +80,7 @@ typedef enum {
 #define BUFSIZE (16 * 1024)
 
 /* FPS calculation constants */
-#define FPS_HISTORY_SIZE       30      /* sliding window size for FPS averaging */
+#define FPS_DEFAULT_WINDOW_SIZE 30    /* default sliding window size for FPS averaging */
 #define FPS_MIN_DURATION_SEC   0.001   /* minimum frame duration (1000 fps max) */
 #define FPS_MAX_DURATION_SEC   1.0     /* maximum frame duration (1 fps min) */
 #define POSTFIX_PATTERN "_%d"
@@ -217,6 +217,10 @@ typedef struct VariantStream {
     int frame_counter;            /* frame counter for interval writing */
     int frame_meta_counter;       /* frame counter for metadata interval writing */
     int64_t segment_start_pts;    /* PTS of current segment start */
+    double last_frame_output_wallclock; /* last wallclock time when frame was output (for seconds mode) */
+    double last_frame_meta_wallclock;   /* last wallclock time when meta was output (for seconds mode) */
+    double last_frame_buffer_wallclock; /* last wallclock time when buffer frame was output (for seconds mode) */
+    double drift_startup_first_wallclock; /* wallclock of first frame for startup window in seconds mode */
 
     /* PTS discontinuity and drift detection */
     int64_t prev_video_pts;           /* previous video PTS for discontinuity detection */
@@ -234,12 +238,26 @@ typedef struct VariantStream {
 
     /* Multiple drift windows with sliding sum calculation */
 #define MAX_DRIFT_WINDOWS 16
+#define TIME_WINDOW_BINS 100        /* number of bins for time-based windows (binned sliding sum) */
     struct {
-        int     window_size;        /* size of this window */
+        int     mode;               /* 0 = frames, 1 = seconds (binned) */
+        int     window_size;        /* size of this window in frames (mode 0) */
+        double  window_seconds;     /* size of this window in seconds (mode 1) */
+        /* Frame-based mode (mode 0): circular buffer */
         double *history;            /* circular buffer of drift values */
+        int     history_capacity;   /* capacity of history buffer */
         int     history_index;      /* current index in circular buffer */
         int     history_count;      /* number of valid entries */
         double  sum;                /* running sum for O(1) updates */
+        /* Time-based mode (mode 1): binned sliding sum - O(1) add, O(1) average, no rounding error */
+        double  bin_sums[TIME_WINDOW_BINS];   /* sum of values in each bin */
+        int     bin_counts[TIME_WINDOW_BINS]; /* count of values in each bin */
+        int     head_bin;           /* current bin index (0..TIME_WINDOW_BINS-1) */
+        double  bin_duration;       /* duration of each bin in seconds */
+        double  head_bin_start;     /* wallclock time when head bin started */
+        double  running_sum;        /* cached sum of all bins */
+        int     running_count;      /* cached count of all bins */
+        /* Common */
         double  current_drift;      /* current averaged drift for this window */
     } drift_windows[MAX_DRIFT_WINDOWS];
     int     nb_drift_windows;       /* number of drift windows configured */
@@ -251,10 +269,21 @@ typedef struct VariantStream {
     /* FPS calculation from actual frame intervals */
     int64_t fps_prev_pts;           /* PTS of previous frame for FPS calculation */
     int     fps_prev_pts_valid;     /* flag indicating fps_prev_pts is valid */
-    double  fps_sum;                /* sum of instantaneous FPS values in window */
-    double  fps_history[FPS_HISTORY_SIZE]; /* circular buffer of FPS values */
+    double  fps_sum;                /* sum of instantaneous FPS values in window (mode 0 only) */
+    /* Frame-based FPS mode: circular buffer */
+    double *fps_history;            /* circular buffer of FPS values */
+    int     fps_history_capacity;   /* capacity of fps_history buffer */
     int     fps_history_index;      /* current index in circular buffer */
     int     fps_history_count;      /* number of valid entries */
+    /* Time-based FPS mode: binned sliding sum */
+    double  fps_bin_sums[TIME_WINDOW_BINS];   /* sum of FPS values in each bin */
+    int     fps_bin_counts[TIME_WINDOW_BINS]; /* count of values in each bin */
+    int     fps_head_bin;           /* current bin index */
+    double  fps_bin_duration;       /* duration of each bin in seconds */
+    double  fps_head_bin_start;     /* wallclock time when head bin started */
+    double  fps_running_sum;        /* cached sum of all bins */
+    int     fps_running_count;      /* cached count of all bins */
+    /* Common */
     double  fps_calculated;         /* current calculated FPS (averaged) */
 
     /* Input stream info for metadata */
@@ -336,37 +365,61 @@ typedef struct HLSContext {
 
     /* Frame output fields */
     char   *frame_output_path;        /* path to frame.raw file (NULL if not used) */
-    int     frame_output_interval;    /* write every Nth frame (default: 1) */
+    char   *frame_output_interval_str; /* interval string (e.g. "25" or "2.5s") */
+    int     frame_output_interval_mode; /* 0 = frames, 1 = seconds */
+    int     frame_output_interval_frames; /* interval in frames (when mode == 0) */
+    double  frame_output_interval_seconds; /* interval in seconds (when mode == 1) */
     char   *frame_meta_output_path;   /* path to frame metadata file (NULL if not used) */
-    int     frame_meta_interval;      /* write metadata every Nth frame (default: 1) */
+    char   *frame_meta_interval_str;  /* interval string (e.g. "1" or "0.5s") */
+    int     frame_meta_interval_mode; /* 0 = frames, 1 = seconds */
+    int     frame_meta_interval_frames; /* interval in frames (when mode == 0) */
+    double  frame_meta_interval_seconds; /* interval in seconds (when mode == 1) */
     FILE   *frame_meta_fp;           /* file handle for frame metadata output (NULL if not used) */
 
     /* Frame buffer fields (circular buffer of last N frames) */
     char   *frame_buffer_output;      /* printf-style template for numbered frame files, e.g. /path/frame_%09d.raw */
-    int     frame_buffer_interval;    /* write every Nth frame to the buffer (default: 1) */
+    char   *frame_buffer_interval_str; /* interval string (e.g. "1" or "0.5s") */
+    int     frame_buffer_interval_mode; /* 0 = frames, 1 = seconds */
+    int     frame_buffer_interval_frames; /* interval in frames (when mode == 0) */
+    double  frame_buffer_interval_seconds; /* interval in seconds (when mode == 1) */
     int     frame_buffer_size;        /* how many latest frames to keep (0 = unlimited) */
     int64_t frame_buffer_index;       /* global counter of frames written to buffer */
+
+    /* FPS calculation window */
+    char   *fps_window_str;           /* FPS window string (e.g. "30" or "1.0s") */
+    int     fps_window_mode;          /* 0 = frames, 1 = seconds */
+    int     fps_window_frames;        /* window size in frames (when mode == 0) */
+    double  fps_window_seconds;       /* window size in seconds (when mode == 1) */
 
     /* PTS discontinuity and drift detection */
     int     pts_discontinuity_exit;   /* if set, exit on PTS discontinuity */
     double  pts_discontinuity_threshold_neg; /* threshold for backward PTS jump (default: 0) */
     double  pts_discontinuity_threshold_pos; /* threshold for forward PTS jump (default: 1) */
-    int     drift_startup_window;     /* number of frames for initial PTS-wallclock sync (default: 10) */
-    char   *drift_window_str;         /* comma-separated list of drift window sizes */
-    int     drift_window_sizes[MAX_DRIFT_WINDOWS]; /* parsed window sizes */
+    char   *drift_startup_window_str; /* startup window string (e.g. "30" or "1.0s") */
+    int     drift_startup_window_mode; /* 0 = frames, 1 = seconds */
+    int     drift_startup_window_frames; /* startup window in frames (when mode == 0) */
+    double  drift_startup_window_seconds; /* startup window in seconds (when mode == 1) */
+    char   *drift_window_str;         /* comma-separated list of drift window sizes (e.g. "1,30,300,900" or "0.04s,1s,10s,30s") */
+    int     drift_window_modes[MAX_DRIFT_WINDOWS]; /* 0 = frames, 1 = seconds per window */
+    int     drift_window_sizes[MAX_DRIFT_WINDOWS]; /* parsed window sizes in frames */
+    double  drift_window_seconds[MAX_DRIFT_WINDOWS]; /* parsed window sizes in seconds */
     int     nb_drift_windows;         /* number of drift windows */
 
     /* Drift threshold options: format "window_size:threshold,..." */
     char   *drift_min_threshold_str;  /* min drift thresholds, e.g. "300:-2,900:-5" */
-    char   *drift_max_threshold_str;  /* max drift thresholds, e.g. "30:2,300:5" */
+    char   *drift_max_threshold_str;  /* max drift thresholds, e.g. "30:2,300:5" or "10s:-2,30s:-5" */
     struct {
-        int window_size;
-        double threshold;
+        int     mode;           /* 0 = frames, 1 = seconds */
+        int     window_size;    /* window size in frames (mode 0) */
+        double  window_seconds; /* window size in seconds (mode 1) */
+        double  threshold;
     } drift_min_thresholds[MAX_DRIFT_WINDOWS];
     int     nb_drift_min_thresholds;
     struct {
-        int window_size;
-        double threshold;
+        int     mode;           /* 0 = frames, 1 = seconds */
+        int     window_size;    /* window size in frames (mode 0) */
+        double  window_seconds; /* window size in seconds (mode 1) */
+        double  threshold;
     } drift_max_thresholds[MAX_DRIFT_WINDOWS];
     int     nb_drift_max_thresholds;
 
@@ -404,6 +457,67 @@ static int strftime_expand(const char *fmt, char **dest)
     *dest = buf;
 
     return r;
+}
+
+/* Binned sliding window helpers for time-based averaging.
+ * These provide O(1) add and O(1) average with no rounding error accumulation.
+ * The window is divided into TIME_WINDOW_BINS bins, each covering window_seconds/TIME_WINDOW_BINS. */
+
+static inline void binned_window_init(double *bin_sums, int *bin_counts, int *head_bin,
+                                      double *bin_duration, double *head_bin_start,
+                                      double *running_sum, int *running_count,
+                                      double window_seconds, double wallclock_now)
+{
+    memset(bin_sums, 0, sizeof(double) * TIME_WINDOW_BINS);
+    memset(bin_counts, 0, sizeof(int) * TIME_WINDOW_BINS);
+    *head_bin = 0;
+    *bin_duration = window_seconds / TIME_WINDOW_BINS;
+    *head_bin_start = wallclock_now;
+    *running_sum = 0.0;
+    *running_count = 0;
+}
+
+static inline void binned_window_add(double *bin_sums, int *bin_counts, int *head_bin,
+                                     double bin_duration, double *head_bin_start,
+                                     double *running_sum, int *running_count,
+                                     double value, double wallclock_now)
+{
+    /* Calculate how many bins have elapsed since head_bin_start */
+    double elapsed = wallclock_now - *head_bin_start;
+    int bins_elapsed = (elapsed >= 0.0) ? (int)(elapsed / bin_duration) : 0;
+
+    if (bins_elapsed >= TIME_WINDOW_BINS) {
+        /* More than a full window has elapsed - clear everything and reset */
+        memset(bin_sums, 0, sizeof(double) * TIME_WINDOW_BINS);
+        memset(bin_counts, 0, sizeof(int) * TIME_WINDOW_BINS);
+        *head_bin = 0;
+        *head_bin_start = wallclock_now;
+        *running_sum = 0.0;
+        *running_count = 0;
+    } else if (bins_elapsed > 0) {
+        /* Clear old bins and subtract from running totals */
+        for (int i = 0; i < bins_elapsed; i++) {
+            int clear_idx = (*head_bin + 1 + i) % TIME_WINDOW_BINS;
+            *running_sum -= bin_sums[clear_idx];
+            *running_count -= bin_counts[clear_idx];
+            bin_sums[clear_idx] = 0.0;
+            bin_counts[clear_idx] = 0;
+        }
+        /* Advance head bin */
+        *head_bin = (*head_bin + bins_elapsed) % TIME_WINDOW_BINS;
+        *head_bin_start += bins_elapsed * bin_duration;
+    }
+
+    /* Add value to current head bin */
+    bin_sums[*head_bin] += value;
+    bin_counts[*head_bin]++;
+    *running_sum += value;
+    (*running_count)++;
+}
+
+static inline double binned_window_average(double running_sum, int running_count)
+{
+    return running_count > 0 ? running_sum / running_count : 0.0;
 }
 
 static int hlsenc_io_open(AVFormatContext *s, AVIOContext **pb, const char *filename,
@@ -2525,6 +2639,9 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
     double time_offset = 0.0;
     AVRational time_base = st->time_base;
     int bgr_size;
+    
+    /* Cache wallclock time once per frame to avoid multiple syscalls */
+    const double wallclock_now = av_gettime() / 1000000.0;
 
     if (!dec_ctx || !frame) {
         av_log(s, AV_LOG_WARNING, "Decoder not initialized for frame output\n");
@@ -2648,7 +2765,7 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
 
     if (hls->flags & HLS_PROGRAM_DATE_TIME) {
         double base_pdt = vs->current_segment_pdt;
-        double now_sec  = av_gettime() / 1000000.0;
+        double now_sec  = wallclock_now;
 
         if (base_pdt <= 0.0) {
             /* Fallback: derive base PDT from run_total_duration (time since
@@ -2678,6 +2795,7 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
     double fps = 0.0;
     {
         int64_t current_pts = pkt->pts;
+        
         if (current_pts != AV_NOPTS_VALUE && vs->fps_prev_pts_valid && 
             vs->fps_prev_pts != AV_NOPTS_VALUE && time_base.den > 0) {
             int64_t pts_diff = current_pts - vs->fps_prev_pts;
@@ -2685,22 +2803,46 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
                 double duration_sec = (double)pts_diff * time_base.num / time_base.den;
                 if (duration_sec > FPS_MIN_DURATION_SEC && duration_sec < FPS_MAX_DURATION_SEC) {
                     double instant_fps = 1.0 / duration_sec;
+                    int capacity = vs->fps_history_capacity;
                     
-                    /* Sliding window average with sum optimization */
-                    int window_size = FPS_HISTORY_SIZE;
-                    if (vs->fps_history_count < window_size) {
-                        /* Window not full yet - just add */
-                        vs->fps_history[vs->fps_history_index] = instant_fps;
-                        vs->fps_sum += instant_fps;
-                        vs->fps_history_count++;
+                    if (hls->fps_window_mode == 0) {
+                        /* Frame-based: sliding window average with sum optimization */
+                        int window_size = hls->fps_window_frames;
+                        if (vs->fps_history && capacity > 0) {
+                            if (vs->fps_history_count < window_size) {
+                                /* Window not full yet - just add */
+                                vs->fps_history[vs->fps_history_index] = instant_fps;
+                                vs->fps_sum += instant_fps;
+                                vs->fps_history_count++;
+                            } else {
+                                /* Window full - subtract old, add new */
+                                vs->fps_sum -= vs->fps_history[vs->fps_history_index];
+                                vs->fps_history[vs->fps_history_index] = instant_fps;
+                                vs->fps_sum += instant_fps;
+                            }
+                            vs->fps_history_index = (vs->fps_history_index + 1) % window_size;
+                            vs->fps_calculated = vs->fps_sum / vs->fps_history_count;
+                        }
                     } else {
-                        /* Window full - subtract old, add new */
-                        vs->fps_sum -= vs->fps_history[vs->fps_history_index];
-                        vs->fps_history[vs->fps_history_index] = instant_fps;
-                        vs->fps_sum += instant_fps;
+                        /* Time-based: binned sliding sum - O(1) add, O(1) average */
+                        /* Initialize on first sample */
+                        if (vs->fps_head_bin_start <= 0.0) {
+                            vs->fps_head_bin_start = wallclock_now;
+                        }
+                        
+                        binned_window_add(vs->fps_bin_sums,
+                                          vs->fps_bin_counts,
+                                          &vs->fps_head_bin,
+                                          vs->fps_bin_duration,
+                                          &vs->fps_head_bin_start,
+                                          &vs->fps_running_sum,
+                                          &vs->fps_running_count,
+                                          instant_fps, wallclock_now);
+                        
+                        vs->fps_calculated = binned_window_average(
+                            vs->fps_running_sum,
+                            vs->fps_running_count);
                     }
-                    vs->fps_history_index = (vs->fps_history_index + 1) % window_size;
-                    vs->fps_calculated = vs->fps_sum / vs->fps_history_count;
                 }
             }
         }
@@ -2722,11 +2864,16 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
     {
         int pos = 0;
         for (int w = 0; w < vs->nb_drift_windows && pos < (int)sizeof(drift_str) - 50; w++) {
-            int wsize = vs->drift_windows[w].window_size;
             double drift_val = vs->drift_windows[w].current_drift;
             if (w > 0)
                 pos += snprintf(drift_str + pos, sizeof(drift_str) - pos, ",");
-            pos += snprintf(drift_str + pos, sizeof(drift_str) - pos, "drift%d=%.6f", wsize, drift_val);
+            if (vs->drift_windows[w].mode == 0) {
+                int wsize = vs->drift_windows[w].window_size;
+                pos += snprintf(drift_str + pos, sizeof(drift_str) - pos, "drift%d=%.6f", wsize, drift_val);
+            } else {
+                double wsec = vs->drift_windows[w].window_seconds;
+                pos += snprintf(drift_str + pos, sizeof(drift_str) - pos, "drift%.1fs=%.6f", wsec, drift_val);
+            }
         }
         if (vs->nb_drift_windows == 0) {
             snprintf(drift_str, sizeof(drift_str), "drift=0.000000");
@@ -2840,14 +2987,37 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
 
         av_log(s, AV_LOG_DEBUG, "Frame written successfully to %s (segment: %s, offset: %.6f, size: %d, pkt_pts=%"PRId64", segment_start_pts=%"PRId64")\n",
                hls->frame_output_path, segment_name, time_offset, bgr_size, pkt->pts, vs->segment_start_pts);
+        
+        /* Update last frame output time for time-based interval mode */
+        if (hls->frame_output_interval_mode == 1) {
+            vs->last_frame_output_wallclock = wallclock_now;
+        }
     }
 
     /* Write metadata to separate file if enabled.
      * Open the metadata file lazily on first use and keep it open for the
      * whole muxer lifetime so that writes are buffered by stdio. */
-    if (hls->frame_meta_output_path && hls->frame_meta_interval > 0) {
+    if (hls->frame_meta_output_path) {
+        int should_write_meta = 0;
         vs->frame_meta_counter++;
-        if (vs->frame_meta_counter % hls->frame_meta_interval == 0) {
+        
+        if (hls->frame_meta_interval_mode == 0) {
+            /* Frame-based interval */
+            should_write_meta = (hls->frame_meta_interval_frames > 0 &&
+                                 vs->frame_meta_counter % hls->frame_meta_interval_frames == 0);
+        } else {
+            /* Time-based interval (seconds) */
+            if (vs->last_frame_meta_wallclock <= 0.0) {
+                should_write_meta = 1;
+            } else {
+                double elapsed = wallclock_now - vs->last_frame_meta_wallclock;
+                if (elapsed >= hls->frame_meta_interval_seconds) {
+                    should_write_meta = 1;
+                }
+            }
+        }
+        
+        if (should_write_meta) {
             FILE *meta_fp = hls->frame_meta_fp;
 
             if (!meta_fp) {
@@ -2874,14 +3044,36 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
                         fps, bitrate, pts, is_keyframe, frame_type,
                         src_codec_name, encoding_flag, gop_size_meta, drift_str);
             }
+            
+            /* Update last meta output time for time-based interval mode */
+            if (hls->frame_meta_interval_mode == 1) {
+                vs->last_frame_meta_wallclock = wallclock_now;
+            }
         }
     }
 
     /* Write to rolling buffer of numbered frame files if enabled.
      * Works independently of hls_frame_output and uses the same BGR+metadata
      * layout as the single-frame output. */
-    if (hls->frame_buffer_output && hls->frame_buffer_interval > 0 &&
-        (vs->frame_counter % hls->frame_buffer_interval == 0)) {
+    int should_write_buffer = 0;
+    if (hls->frame_buffer_output) {
+        if (hls->frame_buffer_interval_mode == 0) {
+            /* Frame-based interval */
+            should_write_buffer = (hls->frame_buffer_interval_frames > 0 &&
+                                   vs->frame_counter % hls->frame_buffer_interval_frames == 0);
+        } else {
+            /* Time-based interval (seconds) */
+            if (vs->last_frame_buffer_wallclock <= 0.0) {
+                should_write_buffer = 1;
+            } else {
+                double elapsed = wallclock_now - vs->last_frame_buffer_wallclock;
+                if (elapsed >= hls->frame_buffer_interval_seconds) {
+                    should_write_buffer = 1;
+                }
+            }
+        }
+    }
+    if (should_write_buffer) {
         char   buf_path[MAX_URL_SIZE];
         char   buf_tmp[MAX_URL_SIZE];
         FILE  *buf_fp;
@@ -2942,6 +3134,11 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
                    buf_tmp, buf_path, strerror(errno));
             unlink(buf_tmp);
             return 0;
+        }
+        
+        /* Update last buffer output time for time-based interval mode */
+        if (hls->frame_buffer_interval_mode == 1) {
+            vs->last_frame_buffer_wallclock = wallclock_now;
         }
 
         /* Maintain circular buffer: delete frames older than frame_buffer_size */
@@ -3126,23 +3323,63 @@ static int hls_write_header(AVFormatContext *s)
                 vs->fps_prev_pts = AV_NOPTS_VALUE;
                 vs->fps_prev_pts_valid = 0;
                 vs->fps_sum = 0.0;
-                vs->fps_history_index = 0;
-                vs->fps_history_count = 0;
                 vs->fps_calculated = 0.0;
                 vs->drift_time_base = inner_st->time_base;
+                
+                /* Initialize FPS calculation */
+                if (hls->fps_window_mode == 0) {
+                    /* Frame-based: allocate circular buffer */
+                    vs->fps_history_capacity = hls->fps_window_frames;
+                    vs->fps_history = av_mallocz(sizeof(double) * vs->fps_history_capacity);
+                    vs->fps_history_index = 0;
+                    vs->fps_history_count = 0;
+                    vs->fps_sum = 0.0;
+                    if (!vs->fps_history) {
+                        av_log(s, AV_LOG_WARNING, "Could not allocate FPS history buffer\n");
+                    }
+                } else {
+                    /* Time-based: use binned sliding sum (initialized on first sample) */
+                    vs->fps_history = NULL;
+                    vs->fps_history_capacity = 0;
+                    vs->fps_bin_duration = hls->fps_window_seconds / TIME_WINDOW_BINS;
+                    vs->fps_head_bin = 0;
+                    vs->fps_head_bin_start = 0.0;  /* Will be set on first sample */
+                    vs->fps_running_sum = 0.0;
+                    vs->fps_running_count = 0;
+                    memset(vs->fps_bin_sums, 0, sizeof(vs->fps_bin_sums));
+                    memset(vs->fps_bin_counts, 0, sizeof(vs->fps_bin_counts));
+                }
 
                 /* Initialize multiple drift windows */
                 vs->nb_drift_windows = hls->nb_drift_windows;
                 for (int w = 0; w < hls->nb_drift_windows; w++) {
-                    int wsize = hls->drift_window_sizes[w];
-                    vs->drift_windows[w].window_size = wsize;
-                    vs->drift_windows[w].history_index = 0;
-                    vs->drift_windows[w].history_count = 0;
-                    vs->drift_windows[w].sum = 0.0;
+                    vs->drift_windows[w].mode = hls->drift_window_modes[w];
+                    vs->drift_windows[w].window_size = hls->drift_window_sizes[w];
+                    vs->drift_windows[w].window_seconds = hls->drift_window_seconds[w];
                     vs->drift_windows[w].current_drift = 0.0;
-                    vs->drift_windows[w].history = av_mallocz(sizeof(double) * wsize);
-                    if (!vs->drift_windows[w].history) {
-                        av_log(s, AV_LOG_WARNING, "Could not allocate drift history buffer for window %d\n", wsize);
+                    
+                    if (vs->drift_windows[w].mode == 0) {
+                        /* Frame-based: allocate circular buffer */
+                        int capacity = vs->drift_windows[w].window_size;
+                        vs->drift_windows[w].history_capacity = capacity;
+                        vs->drift_windows[w].history = av_mallocz(sizeof(double) * capacity);
+                        vs->drift_windows[w].history_index = 0;
+                        vs->drift_windows[w].history_count = 0;
+                        vs->drift_windows[w].sum = 0.0;
+                        if (!vs->drift_windows[w].history) {
+                            av_log(s, AV_LOG_WARNING, "Could not allocate drift history buffer for window %d\n", w);
+                        }
+                    } else {
+                        /* Time-based: use binned sliding sum (initialized on first sample) */
+                        vs->drift_windows[w].history = NULL;
+                        vs->drift_windows[w].history_capacity = 0;
+                        vs->drift_windows[w].bin_duration = vs->drift_windows[w].window_seconds / TIME_WINDOW_BINS;
+                        vs->drift_windows[w].head_bin = 0;
+                        vs->drift_windows[w].head_bin_start = 0.0;  /* Will be set on first sample */
+                        vs->drift_windows[w].running_sum = 0.0;
+                        vs->drift_windows[w].running_count = 0;
+                        memset(vs->drift_windows[w].bin_sums, 0, sizeof(vs->drift_windows[w].bin_sums));
+                        memset(vs->drift_windows[w].bin_counts, 0, sizeof(vs->drift_windows[w].bin_counts));
                     }
                 }
 
@@ -3276,7 +3513,21 @@ static int check_pts_discontinuity_and_update_drift(AVFormatContext *s, HLSConte
         return 0;
 
     /* Phase 1: Startup - find best baseline frame (minimum drift relative to first frame) */
-    if (vs->drift_startup_count < hls->drift_startup_window) {
+    int startup_complete = 0;
+    if (hls->drift_startup_window_mode == 0) {
+        /* Frame-based startup window */
+        startup_complete = (vs->drift_startup_count >= hls->drift_startup_window_frames);
+    } else {
+        /* Time-based startup window (seconds) */
+        if (vs->drift_startup_first_wallclock <= 0.0) {
+            startup_complete = 0;  /* First frame, need to initialize */
+        } else {
+            double elapsed = wallclock_now - vs->drift_startup_first_wallclock;
+            startup_complete = (elapsed >= hls->drift_startup_window_seconds);
+        }
+    }
+    
+    if (!startup_complete) {
         if (vs->drift_startup_count == 0) {
             /* First frame: temporary baseline, drift = 0 by definition */
             vs->drift_first_wallclock = wallclock_now;
@@ -3284,6 +3535,7 @@ static int check_pts_discontinuity_and_update_drift(AVFormatContext *s, HLSConte
             vs->drift_best_wallclock = wallclock_now;
             vs->drift_best_pts_sec = pts_sec;
             vs->drift_min_value = 0.0;
+            vs->drift_startup_first_wallclock = wallclock_now;
         } else {
             /* Calculate drift relative to first frame */
             double expected = vs->drift_first_wallclock + (pts_sec - vs->drift_first_pts_sec);
@@ -3298,7 +3550,15 @@ static int check_pts_discontinuity_and_update_drift(AVFormatContext *s, HLSConte
         }
         vs->drift_startup_count++;
 
-        if (vs->drift_startup_count == hls->drift_startup_window) {
+        /* Check again if startup is now complete */
+        if (hls->drift_startup_window_mode == 0) {
+            startup_complete = (vs->drift_startup_count >= hls->drift_startup_window_frames);
+        } else {
+            double elapsed = wallclock_now - vs->drift_startup_first_wallclock;
+            startup_complete = (elapsed >= hls->drift_startup_window_seconds);
+        }
+        
+        if (startup_complete) {
             /* Use the best frame (minimum drift) as final baseline */
             vs->drift_baseline_wallclock = vs->drift_best_wallclock;
             vs->drift_baseline_pts_sec = vs->drift_best_pts_sec;
@@ -3321,51 +3581,91 @@ static int check_pts_discontinuity_and_update_drift(AVFormatContext *s, HLSConte
      * Negative drift = frames arriving early (stream running fast) */
     instant_drift = wallclock_now - expected_wallclock;
 
-    /* Update all drift windows using sliding sum (O(1) per window) */
+    /* Update all drift windows */
     for (i = 0; i < vs->nb_drift_windows; i++) {
-        int window_size = vs->drift_windows[i].window_size;
-        double *history = vs->drift_windows[i].history;
-        int idx = vs->drift_windows[i].history_index;
-        int count = vs->drift_windows[i].history_count;
+        if (vs->drift_windows[i].mode == 0) {
+            /* Frame-based: sliding sum O(1) with circular buffer */
+            double *history = vs->drift_windows[i].history;
+            if (!history)
+                continue;
+                
+            int window_size = vs->drift_windows[i].window_size;
+            int idx = vs->drift_windows[i].history_index;
+            int count = vs->drift_windows[i].history_count;
 
-        if (!history)
-            continue;
+            /* If buffer is full, subtract the old value being overwritten */
+            if (count == window_size) {
+                vs->drift_windows[i].sum -= history[idx];
+            }
 
-        /* If buffer is full, subtract the old value being overwritten */
-        if (count == window_size) {
-            vs->drift_windows[i].sum -= history[idx];
+            /* Add new value */
+            history[idx] = instant_drift;
+            vs->drift_windows[i].sum += instant_drift;
+
+            /* Update index and count */
+            vs->drift_windows[i].history_index = (idx + 1) % window_size;
+            if (count < window_size)
+                vs->drift_windows[i].history_count = count + 1;
+
+            /* Calculate averaged drift */
+            vs->drift_windows[i].current_drift = vs->drift_windows[i].sum / vs->drift_windows[i].history_count;
+        } else {
+            /* Time-based: binned sliding sum - O(1) add, O(1) average, no memory limit */
+            /* Initialize head_bin_start on first sample */
+            if (vs->drift_windows[i].head_bin_start <= 0.0) {
+                vs->drift_windows[i].head_bin_start = wallclock_now;
+            }
+            
+            binned_window_add(vs->drift_windows[i].bin_sums,
+                              vs->drift_windows[i].bin_counts,
+                              &vs->drift_windows[i].head_bin,
+                              vs->drift_windows[i].bin_duration,
+                              &vs->drift_windows[i].head_bin_start,
+                              &vs->drift_windows[i].running_sum,
+                              &vs->drift_windows[i].running_count,
+                              instant_drift, wallclock_now);
+            
+            vs->drift_windows[i].current_drift = binned_window_average(
+                vs->drift_windows[i].running_sum,
+                vs->drift_windows[i].running_count);
         }
-
-        /* Add new value */
-        history[idx] = instant_drift;
-        vs->drift_windows[i].sum += instant_drift;
-
-        /* Update index and count */
-        vs->drift_windows[i].history_index = (idx + 1) % window_size;
-        if (count < window_size)
-            vs->drift_windows[i].history_count = count + 1;
-
-        /* Calculate averaged drift */
-        vs->drift_windows[i].current_drift = vs->drift_windows[i].sum / vs->drift_windows[i].history_count;
     }
 
     av_log(s, AV_LOG_DEBUG, "Drift: instant=%.6f, windows=%d\n", instant_drift, vs->nb_drift_windows);
 
-    /* Check drift thresholds */
+    /* Check drift thresholds - match by mode and window size/seconds */
     for (i = 0; i < vs->nb_drift_windows; i++) {
-        int window_size = vs->drift_windows[i].window_size;
         double current_drift = vs->drift_windows[i].current_drift;
+        int window_mode = vs->drift_windows[i].mode;
+        int window_size = vs->drift_windows[i].window_size;
+        double window_seconds = vs->drift_windows[i].window_seconds;
         int j;
 
         /* Check min thresholds (drift < threshold triggers exit) */
         for (j = 0; j < hls->nb_drift_min_thresholds; j++) {
-            if (hls->drift_min_thresholds[j].window_size == window_size) {
+            int match = 0;
+            if (window_mode == 0 && hls->drift_min_thresholds[j].mode == 0) {
+                /* Both frame-based: compare window_size */
+                match = (hls->drift_min_thresholds[j].window_size == window_size);
+            } else if (window_mode == 1 && hls->drift_min_thresholds[j].mode == 1) {
+                /* Both time-based: compare window_seconds (with small tolerance, inline for speed) */
+                double diff = hls->drift_min_thresholds[j].window_seconds - window_seconds;
+                match = (diff > -0.001 && diff < 0.001);
+            }
+            if (match) {
                 double threshold = hls->drift_min_thresholds[j].threshold;
                 if (current_drift < threshold) {
-                    av_log(s, AV_LOG_ERROR, "Drift threshold exceeded: drift%d=%.6f < %.6f (min threshold), requesting graceful exit\n",
-                           window_size, current_drift, threshold);
-                    ff_log_event("DRIFT_THRESHOLD", "\"window\":%d,\"drift\":%.6f,\"threshold\":%.6f,\"type\":\"min\"",
-                                  window_size, current_drift, threshold);
+                    if (window_mode == 0) {
+                        av_log(s, AV_LOG_ERROR, "Drift threshold exceeded: drift%d=%.6f < %.6f (min threshold), requesting graceful exit\n",
+                               window_size, current_drift, threshold);
+                        ff_log_event("DRIFT_THRESHOLD", "\"window\":%d,\"drift\":%.6f,\"threshold\":%.6f,\"type\":\"min\"",
+                                      window_size, current_drift, threshold);
+                    } else {
+                        av_log(s, AV_LOG_ERROR, "Drift threshold exceeded: drift%.1fs=%.6f < %.6f (min threshold), requesting graceful exit\n",
+                               window_seconds, current_drift, threshold);
+                        ff_log_event("DRIFT_THRESHOLD", "\"window\":\"%.1fs\",\"drift\":%.6f,\"threshold\":%.6f,\"type\":\"min\"",
+                                      window_seconds, current_drift, threshold);
+                    }
                     ff_log_event("GRACEFUL_EXIT_REQUESTED", "\"reason\":\"drift_min_threshold\"");
                     hls->graceful_exit_requested = 1;
                     return 1;  /* Signal that graceful exit is requested */
@@ -3376,13 +3676,29 @@ static int check_pts_discontinuity_and_update_drift(AVFormatContext *s, HLSConte
 
         /* Check max thresholds (drift > threshold triggers exit) */
         for (j = 0; j < hls->nb_drift_max_thresholds; j++) {
-            if (hls->drift_max_thresholds[j].window_size == window_size) {
+            int match = 0;
+            if (window_mode == 0 && hls->drift_max_thresholds[j].mode == 0) {
+                /* Both frame-based: compare window_size */
+                match = (hls->drift_max_thresholds[j].window_size == window_size);
+            } else if (window_mode == 1 && hls->drift_max_thresholds[j].mode == 1) {
+                /* Both time-based: compare window_seconds (with small tolerance, inline for speed) */
+                double diff = hls->drift_max_thresholds[j].window_seconds - window_seconds;
+                match = (diff > -0.001 && diff < 0.001);
+            }
+            if (match) {
                 double threshold = hls->drift_max_thresholds[j].threshold;
                 if (current_drift > threshold) {
-                    av_log(s, AV_LOG_ERROR, "Drift threshold exceeded: drift%d=%.6f > %.6f (max threshold), requesting graceful exit\n",
-                           window_size, current_drift, threshold);
-                    ff_log_event("DRIFT_THRESHOLD", "\"window\":%d,\"drift\":%.6f,\"threshold\":%.6f,\"type\":\"max\"",
-                                  window_size, current_drift, threshold);
+                    if (window_mode == 0) {
+                        av_log(s, AV_LOG_ERROR, "Drift threshold exceeded: drift%d=%.6f > %.6f (max threshold), requesting graceful exit\n",
+                               window_size, current_drift, threshold);
+                        ff_log_event("DRIFT_THRESHOLD", "\"window\":%d,\"drift\":%.6f,\"threshold\":%.6f,\"type\":\"max\"",
+                                      window_size, current_drift, threshold);
+                    } else {
+                        av_log(s, AV_LOG_ERROR, "Drift threshold exceeded: drift%.1fs=%.6f > %.6f (max threshold), requesting graceful exit\n",
+                               window_seconds, current_drift, threshold);
+                        ff_log_event("DRIFT_THRESHOLD", "\"window\":\"%.1fs\",\"drift\":%.6f,\"threshold\":%.6f,\"type\":\"max\"",
+                                      window_seconds, current_drift, threshold);
+                    }
                     ff_log_event("GRACEFUL_EXIT_REQUESTED", "\"reason\":\"drift_max_threshold\"");
                     hls->graceful_exit_requested = 1;
                     return 1;  /* Signal that graceful exit is requested */
@@ -3521,16 +3837,55 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
             /* Only try to get frame for every Nth packet according to either
              * single-frame output interval, buffer output interval, or unconditionally
              * if frame metadata logging is enabled. */
-            int sample_single = hls->frame_output_path &&
-                                (vs->frame_counter % hls->frame_output_interval == 0);
-            int sample_buffer = hls->frame_buffer_output && hls->frame_buffer_interval > 0 &&
-                                (vs->frame_counter % hls->frame_buffer_interval == 0);
+            
+            /* Cache wallclock for time-based interval checks (avoid multiple syscalls) */
+            double wallclock_now_pkt = 0.0;
+            if ((hls->frame_output_path && hls->frame_output_interval_mode == 1) ||
+                (hls->frame_buffer_output && hls->frame_buffer_interval_mode == 1)) {
+                wallclock_now_pkt = av_gettime() / 1000000.0;
+            }
+            
+            int sample_single = 0;
+            if (hls->frame_output_path) {
+                if (hls->frame_output_interval_mode == 0) {
+                    /* Frame-based interval */
+                    sample_single = (vs->frame_counter % hls->frame_output_interval_frames == 0);
+                } else {
+                    /* Time-based interval (seconds) */
+                    if (vs->last_frame_output_wallclock <= 0.0) {
+                        /* First frame - always output */
+                        sample_single = 1;
+                    } else {
+                        double elapsed = wallclock_now_pkt - vs->last_frame_output_wallclock;
+                        if (elapsed >= hls->frame_output_interval_seconds) {
+                            sample_single = 1;
+                        }
+                    }
+                }
+            }
+            int sample_buffer = 0;
+            if (hls->frame_buffer_output) {
+                if (hls->frame_buffer_interval_mode == 0) {
+                    sample_buffer = (hls->frame_buffer_interval_frames > 0 &&
+                                     vs->frame_counter % hls->frame_buffer_interval_frames == 0);
+                } else {
+                    /* Time-based interval (seconds) */
+                    if (vs->last_frame_buffer_wallclock <= 0.0) {
+                        sample_buffer = 1;
+                    } else {
+                        double elapsed = wallclock_now_pkt - vs->last_frame_buffer_wallclock;
+                        if (elapsed >= hls->frame_buffer_interval_seconds) {
+                            sample_buffer = 1;
+                        }
+                    }
+                }
+            }
             int sample_meta = !!hls->frame_meta_output_path;
 
             if (sample_single || sample_buffer || sample_meta) {
                 av_log(s, AV_LOG_DEBUG,
-                       "Trying to get frame %d (single_interval=%d, buffer_interval=%d)\n",
-                       vs->frame_counter, hls->frame_output_interval, hls->frame_buffer_interval);
+                       "Trying to get frame %d (need decode for output)\n",
+                       vs->frame_counter);
                 need_frame_sample = 1;
             }
         }
@@ -3831,11 +4186,14 @@ static void hls_deinit(AVFormatContext *s)
         av_frame_free(&vs->decoded_frame);
         avcodec_free_context(&vs->decoder_ctx);
 
-        /* Free drift window buffers */
+        /* Free drift window buffers (only frame-based mode uses allocated history) */
         for (int w = 0; w < vs->nb_drift_windows; w++) {
             av_freep(&vs->drift_windows[w].history);
         }
         vs->nb_drift_windows = 0;
+        
+        /* Free FPS history buffer (only frame-based mode uses allocated history) */
+        av_freep(&vs->fps_history);
     }
 
     ff_format_io_close(s, &hls->m3u8_out);
@@ -4000,6 +4358,50 @@ failed:
 }
 
 
+/**
+ * Parse interval string that can be frames ("25") or seconds ("2.5s")
+ * Returns 0 on success, negative error code on failure
+ * Sets: *mode (0=frames, 1=seconds), *frames_val, *seconds_val
+ */
+static int parse_interval_string(const char *str, const char *name,
+                                 int *mode, int *frames_val, double *seconds_val,
+                                 int allow_zero)
+{
+    if (!str || !str[0]) {
+        av_log(NULL, AV_LOG_ERROR, "%s cannot be empty\n", name);
+        return AVERROR(EINVAL);
+    }
+
+    size_t len = strlen(str);
+    if (len > 0 && str[len - 1] == 's') {
+        /* Time-based interval (seconds) */
+        char *endptr;
+        double seconds = strtod(str, &endptr);
+        if (endptr != str + len - 1 || (!allow_zero && seconds <= 0.0) || (allow_zero && seconds < 0.0)) {
+            av_log(NULL, AV_LOG_ERROR, "Invalid %s seconds value: %s\n", name, str);
+            return AVERROR(EINVAL);
+        }
+        *mode = 1;
+        *seconds_val = seconds;
+        *frames_val = 0;
+        av_log(NULL, AV_LOG_INFO, "%s: %.6f seconds\n", name, seconds);
+    } else {
+        /* Frame-based interval */
+        char *endptr;
+        long frames = strtol(str, &endptr, 10);
+        if (endptr != str + len || (!allow_zero && frames < 1) || (allow_zero && frames < 0)) {
+            av_log(NULL, AV_LOG_ERROR, "Invalid %s frames value: %s\n", name, str);
+            return AVERROR(EINVAL);
+        }
+        *mode = 0;
+        *frames_val = (int)frames;
+        *seconds_val = 0.0;
+        av_log(NULL, AV_LOG_INFO, "%s: %d frames\n", name, *frames_val);
+    }
+
+    return 0;
+}
+
 static int hls_init(AVFormatContext *s)
 {
     int ret = 0;
@@ -4016,6 +4418,76 @@ static int hls_init(AVFormatContext *s)
 
     ff_log_event("INIT_START", "\"output\":\"%s\",\"nb_streams\":%d",
                   s->url, s->nb_streams);
+
+    /* Parse frame_output_interval */
+    if (hls->frame_output_interval_str) {
+        ret = parse_interval_string(hls->frame_output_interval_str, "frame_output_interval",
+                                    &hls->frame_output_interval_mode,
+                                    &hls->frame_output_interval_frames,
+                                    &hls->frame_output_interval_seconds, 0);
+        if (ret < 0)
+            return ret;
+    } else {
+        hls->frame_output_interval_mode = 0;
+        hls->frame_output_interval_frames = 1;
+        hls->frame_output_interval_seconds = 0.0;
+    }
+
+    /* Parse frame_meta_interval */
+    if (hls->frame_meta_interval_str) {
+        ret = parse_interval_string(hls->frame_meta_interval_str, "frame_meta_interval",
+                                    &hls->frame_meta_interval_mode,
+                                    &hls->frame_meta_interval_frames,
+                                    &hls->frame_meta_interval_seconds, 0);
+        if (ret < 0)
+            return ret;
+    } else {
+        hls->frame_meta_interval_mode = 0;
+        hls->frame_meta_interval_frames = 1;
+        hls->frame_meta_interval_seconds = 0.0;
+    }
+
+    /* Parse frame_buffer_interval */
+    if (hls->frame_buffer_interval_str) {
+        ret = parse_interval_string(hls->frame_buffer_interval_str, "frame_buffer_interval",
+                                    &hls->frame_buffer_interval_mode,
+                                    &hls->frame_buffer_interval_frames,
+                                    &hls->frame_buffer_interval_seconds, 0);
+        if (ret < 0)
+            return ret;
+    } else {
+        hls->frame_buffer_interval_mode = 0;
+        hls->frame_buffer_interval_frames = 1;
+        hls->frame_buffer_interval_seconds = 0.0;
+    }
+
+    /* Parse fps_window */
+    if (hls->fps_window_str) {
+        ret = parse_interval_string(hls->fps_window_str, "fps_window",
+                                    &hls->fps_window_mode,
+                                    &hls->fps_window_frames,
+                                    &hls->fps_window_seconds, 0);
+        if (ret < 0)
+            return ret;
+    } else {
+        hls->fps_window_mode = 0;
+        hls->fps_window_frames = FPS_DEFAULT_WINDOW_SIZE;
+        hls->fps_window_seconds = 0.0;
+    }
+
+    /* Parse drift_startup_window */
+    if (hls->drift_startup_window_str) {
+        ret = parse_interval_string(hls->drift_startup_window_str, "drift_startup_window",
+                                    &hls->drift_startup_window_mode,
+                                    &hls->drift_startup_window_frames,
+                                    &hls->drift_startup_window_seconds, 0);
+        if (ret < 0)
+            return ret;
+    } else {
+        hls->drift_startup_window_mode = 0;
+        hls->drift_startup_window_frames = 30;
+        hls->drift_startup_window_seconds = 0.0;
+    }
 
     if (hls->use_localtime) {
         pattern = get_default_pattern_localtime_fmt(s);
@@ -4038,7 +4510,7 @@ static int hls_init(AVFormatContext *s)
         av_log(hls, AV_LOG_WARNING, "No HTTP method set, hls muxer defaulting to method PUT.\n");
     }
 
-    /* Parse drift window sizes from comma-separated string */
+    /* Parse drift window sizes from comma-separated string (supports frames or seconds) */
     hls->nb_drift_windows = 0;
     if (hls->drift_window_str && hls->drift_window_str[0]) {
         char *str = av_strdup(hls->drift_window_str);
@@ -4046,11 +4518,30 @@ static int hls_init(AVFormatContext *s)
         if (str) {
             token = av_strtok(str, ",", &saveptr);
             while (token && hls->nb_drift_windows < MAX_DRIFT_WINDOWS) {
-                int wsize = atoi(token);
-                if (wsize > 0) {
-                    hls->drift_window_sizes[hls->nb_drift_windows++] = wsize;
-                    av_log(s, AV_LOG_INFO, "Drift window %d: size=%d frames\n",
-                           hls->nb_drift_windows, wsize);
+                size_t tlen = strlen(token);
+                if (tlen > 0 && token[tlen - 1] == 's') {
+                    /* Time-based window (seconds) */
+                    char *endptr;
+                    double wsec = strtod(token, &endptr);
+                    if (endptr == token + tlen - 1 && wsec > 0.0) {
+                        hls->drift_window_modes[hls->nb_drift_windows] = 1;
+                        hls->drift_window_seconds[hls->nb_drift_windows] = wsec;
+                        hls->drift_window_sizes[hls->nb_drift_windows] = 0;
+                        av_log(s, AV_LOG_INFO, "Drift window %d: size=%.6f seconds\n",
+                               hls->nb_drift_windows + 1, wsec);
+                        hls->nb_drift_windows++;
+                    }
+                } else {
+                    /* Frame-based window */
+                    int wsize = atoi(token);
+                    if (wsize > 0) {
+                        hls->drift_window_modes[hls->nb_drift_windows] = 0;
+                        hls->drift_window_sizes[hls->nb_drift_windows] = wsize;
+                        hls->drift_window_seconds[hls->nb_drift_windows] = 0.0;
+                        av_log(s, AV_LOG_INFO, "Drift window %d: size=%d frames\n",
+                               hls->nb_drift_windows + 1, wsize);
+                        hls->nb_drift_windows++;
+                    }
                 }
                 token = av_strtok(NULL, ",", &saveptr);
             }
@@ -4061,7 +4552,8 @@ static int hls_init(AVFormatContext *s)
         av_log(s, AV_LOG_INFO, "No drift windows configured\n");
     }
 
-    /* Parse min drift thresholds from "window_size:threshold,..." string */
+    /* Parse min drift thresholds from "window:threshold,..." string
+     * Supports both frame-based (e.g. "300:-2") and time-based (e.g. "10s:-2") */
     hls->nb_drift_min_thresholds = 0;
     if (hls->drift_min_threshold_str && hls->drift_min_threshold_str[0]) {
         char *str = av_strdup(hls->drift_min_threshold_str);
@@ -4069,14 +4561,43 @@ static int hls_init(AVFormatContext *s)
         if (str) {
             token = av_strtok(str, ",", &saveptr);
             while (token && hls->nb_drift_min_thresholds < MAX_DRIFT_WINDOWS) {
-                int wsize;
-                double threshold;
-                if (sscanf(token, "%d:%lf", &wsize, &threshold) == 2 && wsize > 0) {
-                    hls->drift_min_thresholds[hls->nb_drift_min_thresholds].window_size = wsize;
-                    hls->drift_min_thresholds[hls->nb_drift_min_thresholds].threshold = threshold;
-                    av_log(s, AV_LOG_INFO, "Drift min threshold: window=%d, threshold=%.6f sec\n",
-                           wsize, threshold);
-                    hls->nb_drift_min_thresholds++;
+                char *colon = strchr(token, ':');
+                if (colon) {
+                    *colon = '\0';
+                    char *window_str = token;
+                    double threshold = strtod(colon + 1, NULL);
+                    size_t wlen = strlen(window_str);
+                    
+                    if (wlen > 0 && window_str[wlen - 1] == 's') {
+                        /* Time-based: "10s:-2" */
+                        char *endptr;
+                        double wsec = strtod(window_str, &endptr);
+                        if (endptr == window_str + wlen - 1 && wsec > 0.0) {
+                            hls->drift_min_thresholds[hls->nb_drift_min_thresholds].mode = 1;
+                            hls->drift_min_thresholds[hls->nb_drift_min_thresholds].window_size = 0;
+                            hls->drift_min_thresholds[hls->nb_drift_min_thresholds].window_seconds = wsec;
+                            hls->drift_min_thresholds[hls->nb_drift_min_thresholds].threshold = threshold;
+                            av_log(s, AV_LOG_INFO, "Drift min threshold: window=%.1fs, threshold=%.6f sec\n",
+                                   wsec, threshold);
+                            hls->nb_drift_min_thresholds++;
+                        } else {
+                            av_log(s, AV_LOG_WARNING, "Invalid drift min threshold window: %s\n", window_str);
+                        }
+                    } else {
+                        /* Frame-based: "300:-2" */
+                        int wsize = atoi(window_str);
+                        if (wsize > 0) {
+                            hls->drift_min_thresholds[hls->nb_drift_min_thresholds].mode = 0;
+                            hls->drift_min_thresholds[hls->nb_drift_min_thresholds].window_size = wsize;
+                            hls->drift_min_thresholds[hls->nb_drift_min_thresholds].window_seconds = 0.0;
+                            hls->drift_min_thresholds[hls->nb_drift_min_thresholds].threshold = threshold;
+                            av_log(s, AV_LOG_INFO, "Drift min threshold: window=%d frames, threshold=%.6f sec\n",
+                                   wsize, threshold);
+                            hls->nb_drift_min_thresholds++;
+                        } else {
+                            av_log(s, AV_LOG_WARNING, "Invalid drift min threshold window: %s\n", window_str);
+                        }
+                    }
                 } else {
                     av_log(s, AV_LOG_WARNING, "Invalid drift min threshold format: %s (expected window:threshold)\n", token);
                 }
@@ -4086,7 +4607,8 @@ static int hls_init(AVFormatContext *s)
         }
     }
 
-    /* Parse max drift thresholds from "window_size:threshold,..." string */
+    /* Parse max drift thresholds from "window:threshold,..." string
+     * Supports both frame-based (e.g. "300:5") and time-based (e.g. "10s:2") */
     hls->nb_drift_max_thresholds = 0;
     if (hls->drift_max_threshold_str && hls->drift_max_threshold_str[0]) {
         char *str = av_strdup(hls->drift_max_threshold_str);
@@ -4094,14 +4616,43 @@ static int hls_init(AVFormatContext *s)
         if (str) {
             token = av_strtok(str, ",", &saveptr);
             while (token && hls->nb_drift_max_thresholds < MAX_DRIFT_WINDOWS) {
-                int wsize;
-                double threshold;
-                if (sscanf(token, "%d:%lf", &wsize, &threshold) == 2 && wsize > 0) {
-                    hls->drift_max_thresholds[hls->nb_drift_max_thresholds].window_size = wsize;
-                    hls->drift_max_thresholds[hls->nb_drift_max_thresholds].threshold = threshold;
-                    av_log(s, AV_LOG_INFO, "Drift max threshold: window=%d, threshold=%.6f sec\n",
-                           wsize, threshold);
-                    hls->nb_drift_max_thresholds++;
+                char *colon = strchr(token, ':');
+                if (colon) {
+                    *colon = '\0';
+                    char *window_str = token;
+                    double threshold = strtod(colon + 1, NULL);
+                    size_t wlen = strlen(window_str);
+                    
+                    if (wlen > 0 && window_str[wlen - 1] == 's') {
+                        /* Time-based: "10s:2" */
+                        char *endptr;
+                        double wsec = strtod(window_str, &endptr);
+                        if (endptr == window_str + wlen - 1 && wsec > 0.0) {
+                            hls->drift_max_thresholds[hls->nb_drift_max_thresholds].mode = 1;
+                            hls->drift_max_thresholds[hls->nb_drift_max_thresholds].window_size = 0;
+                            hls->drift_max_thresholds[hls->nb_drift_max_thresholds].window_seconds = wsec;
+                            hls->drift_max_thresholds[hls->nb_drift_max_thresholds].threshold = threshold;
+                            av_log(s, AV_LOG_INFO, "Drift max threshold: window=%.1fs, threshold=%.6f sec\n",
+                                   wsec, threshold);
+                            hls->nb_drift_max_thresholds++;
+                        } else {
+                            av_log(s, AV_LOG_WARNING, "Invalid drift max threshold window: %s\n", window_str);
+                        }
+                    } else {
+                        /* Frame-based: "300:5" */
+                        int wsize = atoi(window_str);
+                        if (wsize > 0) {
+                            hls->drift_max_thresholds[hls->nb_drift_max_thresholds].mode = 0;
+                            hls->drift_max_thresholds[hls->nb_drift_max_thresholds].window_size = wsize;
+                            hls->drift_max_thresholds[hls->nb_drift_max_thresholds].window_seconds = 0.0;
+                            hls->drift_max_thresholds[hls->nb_drift_max_thresholds].threshold = threshold;
+                            av_log(s, AV_LOG_INFO, "Drift max threshold: window=%d frames, threshold=%.6f sec\n",
+                                   wsize, threshold);
+                            hls->nb_drift_max_thresholds++;
+                        } else {
+                            av_log(s, AV_LOG_WARNING, "Invalid drift max threshold window: %s\n", window_str);
+                        }
+                    }
                 } else {
                     av_log(s, AV_LOG_WARNING, "Invalid drift max threshold format: %s (expected window:threshold)\n", token);
                 }
@@ -4396,19 +4947,20 @@ static const AVOption options[] = {
     {"ignore_io_errors", "Ignore IO errors for stable long-duration runs with network output", OFFSET(ignore_io_errors), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, E },
     {"headers", "set custom HTTP headers, can override built in default headers", OFFSET(headers), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
     {"hls_frame_output", "path to write current frame as BGR raw data", OFFSET(frame_output_path), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
-    {"hls_frame_interval", "write every Nth frame (default: 1)", OFFSET(frame_output_interval), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, E},
+    {"hls_frame_interval", "frame output interval: frames (e.g. \"25\") or seconds (e.g. \"2.5s\")", OFFSET(frame_output_interval_str), AV_OPT_TYPE_STRING, {.str = "1"}, 0, 0, E},
     {"hls_frame_meta_output", "path to write frame metadata (append mode)", OFFSET(frame_meta_output_path), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
-    {"hls_frame_meta_interval", "write metadata every Nth frame (default: 1)", OFFSET(frame_meta_interval), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, E},
+    {"hls_frame_meta_interval", "meta output interval: frames (e.g. \"1\") or seconds (e.g. \"0.5s\")", OFFSET(frame_meta_interval_str), AV_OPT_TYPE_STRING, {.str = "1"}, 0, 0, E},
     {"hls_frame_buffer_output", "template for numbered frame files (e.g. /path/frame_%09d.raw)", OFFSET(frame_buffer_output), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
-    {"hls_frame_buffer_interval", "write every Nth frame into frame buffer (default: 1)", OFFSET(frame_buffer_interval), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, E},
+    {"hls_frame_buffer_interval", "buffer output interval: frames (e.g. \"1\") or seconds (e.g. \"0.5s\")", OFFSET(frame_buffer_interval_str), AV_OPT_TYPE_STRING, {.str = "1"}, 0, 0, E},
     {"hls_frame_buffer_size", "how many last frames to keep in buffer (0 = unlimited)", OFFSET(frame_buffer_size), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, E},
+    {"hls_fps_window", "FPS calculation window: frames (e.g. \"30\") or seconds (e.g. \"1.0s\")", OFFSET(fps_window_str), AV_OPT_TYPE_STRING, {.str = "30"}, 0, 0, E},
     {"hls_pts_discontinuity_exit", "exit process on PTS discontinuity", OFFSET(pts_discontinuity_exit), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, E},
     {"hls_pts_discontinuity_threshold_neg", "threshold for backward PTS jump in seconds", OFFSET(pts_discontinuity_threshold_neg), AV_OPT_TYPE_DOUBLE, {.dbl = 0.1}, 0, DBL_MAX, E},
     {"hls_pts_discontinuity_threshold_pos", "threshold for forward PTS jump in seconds", OFFSET(pts_discontinuity_threshold_pos), AV_OPT_TYPE_DOUBLE, {.dbl = 1.0}, 0, DBL_MAX, E},
-    {"hls_drift_startup_window", "number of frames for initial PTS-wallclock sync", OFFSET(drift_startup_window), AV_OPT_TYPE_INT, {.i64 = 30}, 1, INT_MAX, E},
-    {"hls_drift_window", "comma-separated list of drift averaging window sizes (e.g. 1,30,300,900)", OFFSET(drift_window_str), AV_OPT_TYPE_STRING, {.str = "1,30,300,900"}, 0, 0, E},
-    {"hls_drift_min_threshold", "min drift thresholds per window (e.g. 300:-2,900:-5)", OFFSET(drift_min_threshold_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
-    {"hls_drift_max_threshold", "max drift thresholds per window (e.g. 30:2,300:5)", OFFSET(drift_max_threshold_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
+    {"hls_drift_startup_window", "drift startup window: frames (e.g. \"30\") or seconds (e.g. \"1.0s\")", OFFSET(drift_startup_window_str), AV_OPT_TYPE_STRING, {.str = "30"}, 0, 0, E},
+    {"hls_drift_window", "drift windows (comma-sep): frames (e.g. \"1,30,300\") or seconds (e.g. \"0.04s,1s,10s\")", OFFSET(drift_window_str), AV_OPT_TYPE_STRING, {.str = "1,30,300,900"}, 0, 0, E},
+    {"hls_drift_min_threshold", "min drift thresholds per window (e.g. \"300:-2\" for frames, \"10s:-2\" for seconds)", OFFSET(drift_min_threshold_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
+    {"hls_drift_max_threshold", "max drift thresholds per window (e.g. \"30:2\" for frames, \"10s:2\" for seconds)", OFFSET(drift_max_threshold_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     /* Internal options for auto_h264 - set programmatically, not exposed in help */
     {"hls_input_codec", "input codec name (internal, set by auto_h264)", OFFSET(input_codec_name), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     {"hls_auto_h264_encode", "encoding mode flag (internal, set by auto_h264)", OFFSET(auto_h264_encode), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, E},
