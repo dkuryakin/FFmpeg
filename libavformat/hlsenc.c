@@ -212,8 +212,12 @@ typedef struct VariantStream {
     AVCodecContext *decoder_ctx;  /* decoder context for video stream */
     AVFrame *decoded_frame;       /* decoded frame */
     SwsContext *sws_ctx;          /* context for BGR conversion */
+    int sws_src_w;                /* width used to create sws_ctx */
+    int sws_src_h;                /* height used to create sws_ctx */
+    int sws_src_format;           /* pixel format used to create sws_ctx */
     uint8_t *bgr_buffer;          /* buffer for BGR data */
-    int bgr_linesize[1];          /* line size for BGR buffer */
+    uint8_t *bgr_data[4];         /* pointers for sws_scale (only [0] used for BGR24) */
+    int bgr_linesize[4];          /* line sizes for sws_scale (only [0] used for BGR24) */
     int frame_counter;            /* frame counter for interval writing */
     int frame_meta_counter;       /* frame counter for metadata interval writing */
     int64_t segment_start_pts;    /* PTS of current segment start */
@@ -2764,8 +2768,8 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
            frame->width, frame->height, frame->format);
 
     /* Convert to BGR - create SwsContext lazily if not yet initialized
-     * (this happens when video dimensions were unknown at header time due to low probesize) */
-    if (!vs->sws_ctx) {
+     * or recreate if frame dimensions/format changed (e.g. after stream reconnection) */
+    {
         enum AVPixelFormat pix_fmt = frame->format;
         
         if (frame->width <= 0 || frame->height <= 0) {
@@ -2778,16 +2782,36 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
             pix_fmt = AV_PIX_FMT_YUV420P; /* default fallback */
         }
         
-        av_log(s, AV_LOG_INFO, "Creating SwsContext lazily for %dx%d format=%d\n",
-               frame->width, frame->height, pix_fmt);
+        /* Check if we need to recreate SwsContext due to changed parameters */
+        if (vs->sws_ctx) {
+            if (vs->sws_src_w != frame->width || vs->sws_src_h != frame->height ||
+                vs->sws_src_format != pix_fmt) {
+                av_log(s, AV_LOG_INFO, "Frame parameters changed (%dx%d fmt=%d -> %dx%d fmt=%d), recreating SwsContext\n",
+                       vs->sws_src_w, vs->sws_src_h, vs->sws_src_format,
+                       frame->width, frame->height, pix_fmt);
+                sws_freeContext(vs->sws_ctx);
+                vs->sws_ctx = NULL;
+            }
+        }
         
-        vs->sws_ctx = sws_getContext(frame->width, frame->height, pix_fmt,
-                                     frame->width, frame->height, AV_PIX_FMT_BGR24,
-                                     SWS_FAST_BILINEAR, NULL, NULL, NULL);
         if (!vs->sws_ctx) {
-            av_log(s, AV_LOG_WARNING, "Could not create SwsContext for %dx%d format=%d\n",
-                   frame->width, frame->height, pix_fmt);
-            return 0;
+            av_log(s, AV_LOG_INFO, "Creating SwsContext for %dx%d format=%d linesize=[%d,%d,%d]\n",
+                   frame->width, frame->height, pix_fmt,
+                   frame->linesize[0], frame->linesize[1], frame->linesize[2]);
+            
+            vs->sws_ctx = sws_getContext(frame->width, frame->height, pix_fmt,
+                                         frame->width, frame->height, AV_PIX_FMT_BGR24,
+                                         SWS_FAST_BILINEAR, NULL, NULL, NULL);
+            if (!vs->sws_ctx) {
+                av_log(s, AV_LOG_WARNING, "Could not create SwsContext for %dx%d format=%d\n",
+                       frame->width, frame->height, pix_fmt);
+                return 0;
+            }
+            
+            /* Remember parameters to detect changes */
+            vs->sws_src_w = frame->width;
+            vs->sws_src_h = frame->height;
+            vs->sws_src_format = pix_fmt;
         }
     }
 
@@ -2804,12 +2828,23 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
             av_log(s, AV_LOG_WARNING, "Error allocating BGR buffer\n");
             return 0;
         }
+        /* Initialize all 4 elements to avoid reading garbage in sws_scale */
+        vs->bgr_data[0] = vs->bgr_buffer;
+        vs->bgr_data[1] = NULL;
+        vs->bgr_data[2] = NULL;
+        vs->bgr_data[3] = NULL;
         vs->bgr_linesize[0] = frame->width * 3;
-        av_log(s, AV_LOG_DEBUG, "Allocated BGR buffer: %d bytes\n", bgr_size);
+        vs->bgr_linesize[1] = 0;
+        vs->bgr_linesize[2] = 0;
+        vs->bgr_linesize[3] = 0;
+        av_log(s, AV_LOG_DEBUG, "Allocated BGR buffer: %d bytes, linesize=%d\n", bgr_size, vs->bgr_linesize[0]);
     }
 
+    /* Ensure bgr_data[0] always points to current buffer */
+    vs->bgr_data[0] = vs->bgr_buffer;
+    
     ret = sws_scale(vs->sws_ctx, (const uint8_t * const *)frame->data, frame->linesize,
-                    0, frame->height, &vs->bgr_buffer, vs->bgr_linesize);
+                    0, frame->height, vs->bgr_data, vs->bgr_linesize);
     if (ret < 0) {
         av_log(s, AV_LOG_WARNING, "Error converting frame to BGR: %s\n", av_err2str(ret));
         return 0;
