@@ -175,7 +175,7 @@ Real-time frame extraction during HLS encoding for external processing (e.g., AI
 
 ### Frame Interval Modes
 
-The `hls_frame_interval` option supports two modes:
+The `hls_frame_interval` option supports three modes:
 
 **Frames mode** (default): Write every Nth frame
 ```bash
@@ -190,10 +190,25 @@ The `hls_frame_interval` option supports two modes:
 -hls_frame_interval 0.5s    # every 0.5 seconds (2 per second)
 ```
 
+**Keyframes-only mode**: Write only keyframes (I-frames)
+```bash
+-hls_frame_interval keyframes_only   # only keyframes
+-hls_frame_interval keyframes        # alias
+-hls_frame_interval keyframe         # alias
+```
+
 **Behavior:**
-- First frame is **always written** regardless of mode (no need to wait for FPS detection)
+
+| Mode | Decoding | Frame Output | CPU Usage |
+|------|----------|--------------|-----------|
+| Frames | Every frame | Every Nth frame | High |
+| Seconds | Every frame | Every N seconds | High |
+| Keyframes-only | Only keyframes | Every keyframe | **Low** |
+
+- In **frames/seconds modes**: First frame is always written, decoding happens for every frame
+- In **keyframes-only mode**: Only keyframes are sent to decoder, significantly reducing CPU usage
 - Seconds mode uses wall-clock time, not PTS — works reliably even with variable FPS
-- Decoding and metrics calculation (FPS, drift, GOP) happen for **every frame**; only the output is throttled
+- FPS, drift, GOP metrics still work correctly in all modes
 
 ### Frame Output Format
 
@@ -245,6 +260,15 @@ ffmpeg -rtsp_transport tcp -i rtsp://camera/stream \
     -hls_frame_meta_output /tmp/frames.log \
     -hls_frame_buffer_output /tmp/frames/frame_%09d.raw \
     -hls_frame_buffer_size 100 \
+    playlist.m3u8
+
+# Keyframes only (lowest CPU usage, ideal for thumbnail generation)
+ffmpeg -rtsp_transport tcp -i rtsp://camera/stream \
+    -c:v auto_h264 \
+    -f hls \
+    -hls_frame_output /tmp/current_frame.raw \
+    -hls_frame_interval keyframes_only \
+    -hls_frame_meta_output /tmp/frames.log \
     playlist.m3u8
 ```
 

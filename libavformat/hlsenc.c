@@ -338,9 +338,10 @@ typedef struct HLSContext {
 
     /* Frame output fields */
     char   *frame_output_path;        /* path to frame.raw file (NULL if not used) */
-    char   *frame_output_interval_str; /* interval string: "N" for frames or "Ns" for seconds */
-    int     frame_output_interval;    /* parsed: write every Nth frame (0 if using seconds mode) */
-    double  frame_output_interval_sec; /* parsed: write every N seconds (0 if using frames mode) */
+    char   *frame_output_interval_str; /* interval string: "N" for frames, "Ns" for seconds, or "keyframes_only" */
+    int     frame_output_interval;    /* parsed: write every Nth frame (0 if using seconds or keyframes mode) */
+    double  frame_output_interval_sec; /* parsed: write every N seconds (0 if using frames or keyframes mode) */
+    int     frame_output_keyframes_only; /* parsed: 1 if only keyframes should be decoded and written */
     char   *frame_meta_output_path;   /* path to frame metadata file (NULL if not used) */
     int     frame_meta_interval;      /* write metadata every Nth frame (default: 1) */
     FILE   *frame_meta_fp;           /* file handle for frame metadata output (NULL if not used) */
@@ -2778,15 +2779,19 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
     char    frame_type = av_get_picture_type_char(frame->pict_type);
 
     /* Write single latest frame if enabled (legacy hls_frame_output).
-     * Supports two modes:
+     * Supports three modes:
      * - Frames mode: write every Nth frame (frame_output_interval > 0)
      * - Seconds mode: write every N seconds (frame_output_interval_sec > 0)
+     * - Keyframes-only mode: write every keyframe (frame_output_keyframes_only)
      * First frame is always written regardless of mode. */
     int should_write_frame = 0;
     if (hls->frame_output_path) {
         double now = av_gettime() / 1000000.0;
         
-        if (!vs->first_frame_written) {
+        if (hls->frame_output_keyframes_only) {
+            /* Keyframes-only mode: always write (we only decode keyframes anyway) */
+            should_write_frame = 1;
+        } else if (!vs->first_frame_written) {
             /* Always write first frame */
             should_write_frame = 1;
             vs->first_frame_written = 1;
@@ -3533,9 +3538,10 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
     }
 
     /* Determine whether this packet should produce a decoded frame for auxiliary outputs.
-     * We still send every packet to the decoder, but only attempt to drain a frame when
-     * the configured intervals request it. */
+     * In keyframes_only mode, we only decode keyframes to save CPU.
+     * Otherwise, we decode every frame for accurate metrics. */
     int need_frame_sample = 0;
+    int is_keyframe = (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
     if (hls_has_frame_outputs(hls) &&
         st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && vs && oc) {
         if (!vs->decoder_ctx) {
@@ -3544,19 +3550,31 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
         } else {
             vs->frame_counter++;
 
-            /* Always send packets to decoder (it needs all of them) */
-            int ret = avcodec_send_packet(vs->decoder_ctx, pkt);
-            if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
-                av_log(s, AV_LOG_WARNING, "Error sending packet to decoder: %s\n", av_err2str(ret));
-            }
+            if (hls->frame_output_keyframes_only) {
+                /* Keyframes-only mode: only send keyframes to decoder */
+                if (is_keyframe) {
+                    int ret = avcodec_send_packet(vs->decoder_ctx, pkt);
+                    if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
+                        av_log(s, AV_LOG_WARNING, "Error sending keyframe to decoder: %s\n", av_err2str(ret));
+                    }
+                    av_log(s, AV_LOG_DEBUG,
+                           "Keyframe %d sent to decoder for frame output\n", vs->frame_counter);
+                    need_frame_sample = 1;
+                }
+            } else {
+                /* Normal mode: send all packets to decoder */
+                int ret = avcodec_send_packet(vs->decoder_ctx, pkt);
+                if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
+                    av_log(s, AV_LOG_WARNING, "Error sending packet to decoder: %s\n", av_err2str(ret));
+                }
 
-            /* Always try to decode every frame when frame outputs are enabled.
-             * Metrics (FPS, drift, GOP) must be calculated for every frame.
-             * The actual writing of BGR data is controlled by intervals inside write_frame_raw. */
-            av_log(s, AV_LOG_DEBUG,
-                   "Trying to get frame %d (single_interval=%d, buffer_interval=%d)\n",
-                   vs->frame_counter, hls->frame_output_interval, hls->frame_buffer_interval);
-            need_frame_sample = 1;
+                /* Try to decode every frame for accurate metrics.
+                 * The actual writing of BGR data is controlled by intervals inside write_frame_raw. */
+                av_log(s, AV_LOG_DEBUG,
+                       "Trying to get frame %d (single_interval=%d, buffer_interval=%d)\n",
+                       vs->frame_counter, hls->frame_output_interval, hls->frame_buffer_interval);
+                need_frame_sample = 1;
+            }
         }
     }
 
@@ -4063,32 +4081,41 @@ static int hls_init(AVFormatContext *s)
         av_log(hls, AV_LOG_WARNING, "No HTTP method set, hls muxer defaulting to method PUT.\n");
     }
 
-    /* Parse frame_output_interval: "N" for frames, "Ns" or "N.Ms" for seconds */
+    /* Parse frame_output_interval: "N" for frames, "Ns" for seconds, or "keyframes_only" */
     hls->frame_output_interval = 0;
     hls->frame_output_interval_sec = 0.0;
+    hls->frame_output_keyframes_only = 0;
     if (hls->frame_output_interval_str && hls->frame_output_interval_str[0]) {
-        size_t len = strlen(hls->frame_output_interval_str);
-        if (len > 0 && (hls->frame_output_interval_str[len - 1] == 's' ||
-                        hls->frame_output_interval_str[len - 1] == 'S')) {
-            /* Seconds mode: "1s", "2.5s", "0.5s" */
-            hls->frame_output_interval_sec = atof(hls->frame_output_interval_str);
-            if (hls->frame_output_interval_sec <= 0) {
-                av_log(s, AV_LOG_WARNING, "Invalid frame_output_interval '%s', using 1s\n",
-                       hls->frame_output_interval_str);
-                hls->frame_output_interval_sec = 1.0;
-            }
-            av_log(s, AV_LOG_INFO, "Frame output interval: %.3f seconds\n",
-                   hls->frame_output_interval_sec);
+        if (!av_strcasecmp(hls->frame_output_interval_str, "keyframes_only") ||
+            !av_strcasecmp(hls->frame_output_interval_str, "keyframe") ||
+            !av_strcasecmp(hls->frame_output_interval_str, "keyframes")) {
+            /* Keyframes-only mode */
+            hls->frame_output_keyframes_only = 1;
+            av_log(s, AV_LOG_INFO, "Frame output interval: keyframes only\n");
         } else {
-            /* Frames mode: "1", "10", "30" */
-            hls->frame_output_interval = atoi(hls->frame_output_interval_str);
-            if (hls->frame_output_interval <= 0) {
-                av_log(s, AV_LOG_WARNING, "Invalid frame_output_interval '%s', using 1\n",
-                       hls->frame_output_interval_str);
-                hls->frame_output_interval = 1;
+            size_t len = strlen(hls->frame_output_interval_str);
+            if (len > 0 && (hls->frame_output_interval_str[len - 1] == 's' ||
+                            hls->frame_output_interval_str[len - 1] == 'S')) {
+                /* Seconds mode: "1s", "2.5s", "0.5s" */
+                hls->frame_output_interval_sec = atof(hls->frame_output_interval_str);
+                if (hls->frame_output_interval_sec <= 0) {
+                    av_log(s, AV_LOG_WARNING, "Invalid frame_output_interval '%s', using 1s\n",
+                           hls->frame_output_interval_str);
+                    hls->frame_output_interval_sec = 1.0;
+                }
+                av_log(s, AV_LOG_INFO, "Frame output interval: %.3f seconds\n",
+                       hls->frame_output_interval_sec);
+            } else {
+                /* Frames mode: "1", "10", "30" */
+                hls->frame_output_interval = atoi(hls->frame_output_interval_str);
+                if (hls->frame_output_interval <= 0) {
+                    av_log(s, AV_LOG_WARNING, "Invalid frame_output_interval '%s', using 1\n",
+                           hls->frame_output_interval_str);
+                    hls->frame_output_interval = 1;
+                }
+                av_log(s, AV_LOG_INFO, "Frame output interval: %d frames\n",
+                       hls->frame_output_interval);
             }
-            av_log(s, AV_LOG_INFO, "Frame output interval: %d frames\n",
-                   hls->frame_output_interval);
         }
     } else {
         /* Default: every frame */
