@@ -166,12 +166,34 @@ Real-time frame extraction during HLS encoding for external processing (e.g., AI
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `hls_frame_output` | string | NULL | Path to write current frame as BGR raw data |
-| `hls_frame_interval` | int | 1 | Write every Nth frame |
+| `hls_frame_interval` | string | "1" | Write every Nth frame or every Ns seconds (see below) |
 | `hls_frame_meta_output` | string | NULL | Path to write frame metadata (append mode) |
 | `hls_frame_meta_interval` | int | 1 | Write metadata every Nth frame |
 | `hls_frame_buffer_output` | string | NULL | Template for numbered frame files (e.g., `/path/frame_%09d.raw`) |
 | `hls_frame_buffer_interval` | int | 1 | Write every Nth frame into frame buffer |
 | `hls_frame_buffer_size` | int | 0 | How many last frames to keep in buffer (0 = unlimited) |
+
+### Frame Interval Modes
+
+The `hls_frame_interval` option supports two modes:
+
+**Frames mode** (default): Write every Nth frame
+```bash
+-hls_frame_interval 10      # every 10th frame
+-hls_frame_interval 30      # every 30th frame (roughly 1 per second at 30fps)
+```
+
+**Seconds mode**: Write every N seconds (supports decimals)
+```bash
+-hls_frame_interval 1s      # every 1 second
+-hls_frame_interval 2.5s    # every 2.5 seconds
+-hls_frame_interval 0.5s    # every 0.5 seconds (2 per second)
+```
+
+**Behavior:**
+- First frame is **always written** regardless of mode (no need to wait for FPS detection)
+- Seconds mode uses wall-clock time, not PTS — works reliably even with variable FPS
+- Decoding and metrics calculation (FPS, drift, GOP) happen for **every frame**; only the output is throttled
 
 ### Frame Output Format
 
@@ -202,14 +224,24 @@ width=1920,height=1080,fps=25.000,bitrate=4000000,pts=123456,is_keyframe=1,frame
 codec=hevc,encoding=1,gop_size=24,drift1=0.001234,drift30=0.002345,drift300=0.003456,drift900=0.004567
 ```
 
-### Usage Example
+### Usage Examples
 
 ```bash
+# Frame interval by frame count
 ffmpeg -rtsp_transport tcp -i rtsp://camera/stream \
     -c:v auto_h264 \
     -f hls \
     -hls_frame_output /tmp/current_frame.raw \
     -hls_frame_interval 10 \
+    -hls_frame_meta_output /tmp/frames.log \
+    playlist.m3u8
+
+# Frame interval by seconds (recommended for variable FPS)
+ffmpeg -rtsp_transport tcp -i rtsp://camera/stream \
+    -c:v auto_h264 \
+    -f hls \
+    -hls_frame_output /tmp/current_frame.raw \
+    -hls_frame_interval 2s \
     -hls_frame_meta_output /tmp/frames.log \
     -hls_frame_buffer_output /tmp/frames/frame_%09d.raw \
     -hls_frame_buffer_size 100 \
@@ -630,6 +662,7 @@ ffmpeg \
     -hls_segment_filename segments/segment_%05d.ts \
     -hls_base_url segments/ \
     -hls_frame_output /tmp/last_frame.raw \
+    -hls_frame_interval 2s \
     -hls_frame_meta_output /tmp/frames.log \
     -hls_pts_discontinuity_exit 1 \
     -hls_pts_discontinuity_threshold_neg 0.1 \
@@ -659,6 +692,7 @@ ffmpeg \
 | **Segments** | `hls_list_size` | **0** | Playlist size (0=infinite) |
 | **Flags** | `hls_flags` | **append+omit+pdt** | Live streaming flags |
 | **Frame Output** | `hls_frame_output` | NULL | Current frame extraction |
+| **Frame Output** | `hls_frame_interval` | "1" | Frame output interval (frames or seconds) |
 | **Frame Output** | `hls_frame_buffer_output` | NULL | Circular frame buffer |
 | **Frame Output** | `hls_frame_meta_output` | NULL | Frame metadata logging |
 | **Monitoring** | `hls_pts_discontinuity_exit` | **1** | Exit on stream issues |

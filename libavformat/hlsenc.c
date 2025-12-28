@@ -217,6 +217,8 @@ typedef struct VariantStream {
     int frame_counter;            /* frame counter for interval writing */
     int frame_meta_counter;       /* frame counter for metadata interval writing */
     int64_t segment_start_pts;    /* PTS of current segment start */
+    double last_frame_output_time; /* wallclock time of last frame output (for seconds mode) */
+    int first_frame_written;       /* flag: first frame always written */
 
     /* PTS discontinuity and drift detection */
     int64_t prev_video_pts;           /* previous video PTS for discontinuity detection */
@@ -336,7 +338,9 @@ typedef struct HLSContext {
 
     /* Frame output fields */
     char   *frame_output_path;        /* path to frame.raw file (NULL if not used) */
-    int     frame_output_interval;    /* write every Nth frame (default: 1) */
+    char   *frame_output_interval_str; /* interval string: "N" for frames or "Ns" for seconds */
+    int     frame_output_interval;    /* parsed: write every Nth frame (0 if using seconds mode) */
+    double  frame_output_interval_sec; /* parsed: write every N seconds (0 if using frames mode) */
     char   *frame_meta_output_path;   /* path to frame metadata file (NULL if not used) */
     int     frame_meta_interval;      /* write metadata every Nth frame (default: 1) */
     FILE   *frame_meta_fp;           /* file handle for frame metadata output (NULL if not used) */
@@ -2774,9 +2778,35 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
     char    frame_type = av_get_picture_type_char(frame->pict_type);
 
     /* Write single latest frame if enabled (legacy hls_frame_output).
-     * Only write when frame counter matches the configured interval. */
-    if (hls->frame_output_path &&
-        (vs->frame_counter % hls->frame_output_interval == 0)) {
+     * Supports two modes:
+     * - Frames mode: write every Nth frame (frame_output_interval > 0)
+     * - Seconds mode: write every N seconds (frame_output_interval_sec > 0)
+     * First frame is always written regardless of mode. */
+    int should_write_frame = 0;
+    if (hls->frame_output_path) {
+        double now = av_gettime() / 1000000.0;
+        
+        if (!vs->first_frame_written) {
+            /* Always write first frame */
+            should_write_frame = 1;
+            vs->first_frame_written = 1;
+            vs->last_frame_output_time = now;
+        } else if (hls->frame_output_interval_sec > 0) {
+            /* Seconds mode: check time elapsed since last write */
+            double elapsed = now - vs->last_frame_output_time;
+            if (elapsed >= hls->frame_output_interval_sec) {
+                should_write_frame = 1;
+                vs->last_frame_output_time = now;
+            }
+        } else if (hls->frame_output_interval > 0) {
+            /* Frames mode: check frame counter */
+            if (vs->frame_counter % hls->frame_output_interval == 0) {
+                should_write_frame = 1;
+            }
+        }
+    }
+    
+    if (should_write_frame) {
         /* Create temporary file path */
         snprintf(temp_path, sizeof(temp_path), "%s.tmp", hls->frame_output_path);
 
@@ -3843,6 +3873,7 @@ static void hls_deinit(AVFormatContext *s)
     ff_log_event("DEINIT_COMPLETE", NULL);
     av_freep(&hls->key_basename);
     av_freep(&hls->frame_output_path);
+    av_freep(&hls->frame_output_interval_str);
     av_freep(&hls->frame_meta_output_path);
     av_freep(&hls->frame_buffer_output);
     av_freep(&hls->var_streams);
@@ -4030,6 +4061,38 @@ static int hls_init(AVFormatContext *s)
 
     if (!hls->method && http_base_proto) {
         av_log(hls, AV_LOG_WARNING, "No HTTP method set, hls muxer defaulting to method PUT.\n");
+    }
+
+    /* Parse frame_output_interval: "N" for frames, "Ns" or "N.Ms" for seconds */
+    hls->frame_output_interval = 0;
+    hls->frame_output_interval_sec = 0.0;
+    if (hls->frame_output_interval_str && hls->frame_output_interval_str[0]) {
+        size_t len = strlen(hls->frame_output_interval_str);
+        if (len > 0 && (hls->frame_output_interval_str[len - 1] == 's' ||
+                        hls->frame_output_interval_str[len - 1] == 'S')) {
+            /* Seconds mode: "1s", "2.5s", "0.5s" */
+            hls->frame_output_interval_sec = atof(hls->frame_output_interval_str);
+            if (hls->frame_output_interval_sec <= 0) {
+                av_log(s, AV_LOG_WARNING, "Invalid frame_output_interval '%s', using 1s\n",
+                       hls->frame_output_interval_str);
+                hls->frame_output_interval_sec = 1.0;
+            }
+            av_log(s, AV_LOG_INFO, "Frame output interval: %.3f seconds\n",
+                   hls->frame_output_interval_sec);
+        } else {
+            /* Frames mode: "1", "10", "30" */
+            hls->frame_output_interval = atoi(hls->frame_output_interval_str);
+            if (hls->frame_output_interval <= 0) {
+                av_log(s, AV_LOG_WARNING, "Invalid frame_output_interval '%s', using 1\n",
+                       hls->frame_output_interval_str);
+                hls->frame_output_interval = 1;
+            }
+            av_log(s, AV_LOG_INFO, "Frame output interval: %d frames\n",
+                   hls->frame_output_interval);
+        }
+    } else {
+        /* Default: every frame */
+        hls->frame_output_interval = 1;
     }
 
     /* Parse drift window sizes from comma-separated string */
@@ -4390,7 +4453,7 @@ static const AVOption options[] = {
     {"ignore_io_errors", "Ignore IO errors for stable long-duration runs with network output", OFFSET(ignore_io_errors), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, E },
     {"headers", "set custom HTTP headers, can override built in default headers", OFFSET(headers), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
     {"hls_frame_output", "path to write current frame as BGR raw data", OFFSET(frame_output_path), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
-    {"hls_frame_interval", "write every Nth frame (default: 1)", OFFSET(frame_output_interval), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, E},
+    {"hls_frame_interval", "write every Nth frame or every Ns seconds (e.g. '10' or '2s' or '0.5s')", OFFSET(frame_output_interval_str), AV_OPT_TYPE_STRING, {.str = "1"}, 0, 0, E},
     {"hls_frame_meta_output", "path to write frame metadata (append mode)", OFFSET(frame_meta_output_path), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     {"hls_frame_meta_interval", "write metadata every Nth frame (default: 1)", OFFSET(frame_meta_interval), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, E},
     {"hls_frame_buffer_output", "template for numbered frame files (e.g. /path/frame_%09d.raw)", OFFSET(frame_buffer_output), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
