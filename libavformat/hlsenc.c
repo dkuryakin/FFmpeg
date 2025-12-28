@@ -2773,8 +2773,10 @@ static int write_frame_raw(AVFormatContext *s, HLSContext *hls, VariantStream *v
     int64_t pts = pkt->pts;
     char    frame_type = av_get_picture_type_char(frame->pict_type);
 
-    /* Write single latest frame if enabled (legacy hls_frame_output). */
-    if (hls->frame_output_path) {
+    /* Write single latest frame if enabled (legacy hls_frame_output).
+     * Only write when frame counter matches the configured interval. */
+    if (hls->frame_output_path &&
+        (vs->frame_counter % hls->frame_output_interval == 0)) {
         /* Create temporary file path */
         snprintf(temp_path, sizeof(temp_path), "%s.tmp", hls->frame_output_path);
 
@@ -3518,21 +3520,13 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
                 av_log(s, AV_LOG_WARNING, "Error sending packet to decoder: %s\n", av_err2str(ret));
             }
 
-            /* Only try to get frame for every Nth packet according to either
-             * single-frame output interval, buffer output interval, or unconditionally
-             * if frame metadata logging is enabled. */
-            int sample_single = hls->frame_output_path &&
-                                (vs->frame_counter % hls->frame_output_interval == 0);
-            int sample_buffer = hls->frame_buffer_output && hls->frame_buffer_interval > 0 &&
-                                (vs->frame_counter % hls->frame_buffer_interval == 0);
-            int sample_meta = !!hls->frame_meta_output_path;
-
-            if (sample_single || sample_buffer || sample_meta) {
-                av_log(s, AV_LOG_DEBUG,
-                       "Trying to get frame %d (single_interval=%d, buffer_interval=%d)\n",
-                       vs->frame_counter, hls->frame_output_interval, hls->frame_buffer_interval);
-                need_frame_sample = 1;
-            }
+            /* Always try to decode every frame when frame outputs are enabled.
+             * Metrics (FPS, drift, GOP) must be calculated for every frame.
+             * The actual writing of BGR data is controlled by intervals inside write_frame_raw. */
+            av_log(s, AV_LOG_DEBUG,
+                   "Trying to get frame %d (single_interval=%d, buffer_interval=%d)\n",
+                   vs->frame_counter, hls->frame_output_interval, hls->frame_buffer_interval);
+            need_frame_sample = 1;
         }
     }
 
